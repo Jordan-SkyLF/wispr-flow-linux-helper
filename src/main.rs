@@ -92,8 +92,8 @@ fn main() {
     let ipc = IpcWriter { tx: tx.clone() };
     // Global key capture: streams `KeypressEvent`s on fd 3 so push-to-talk and
     // the in-app shortcut recorder work (the app has no hotkey detection of its
-    // own — see capture/mod.rs). XInput2 on X11, evdev elsewhere. The returned
-    // handle answers `CheckStaleKeys`. Independent of the focus/injection backend.
+    // own — see capture/mod.rs). Portal is the default; raw capture requires an
+    // explicit legacy mode. The returned handle answers `CheckStaleKeys`.
     let held_keys = capture::spawn(tx.clone());
     // The backend gets its own sink for async helper-initiated events (focus).
     let mut be = backend::detect(tx);
@@ -254,9 +254,9 @@ fn handle_request(
 
         // ---- stale-key recovery ----
         // The app polls this every ~5s with the keycodes it believes are held;
-        // we answer with the subset that is NOT physically held right now (so it
-        // can drop keys stuck by a missed release / unplugged device). Keycodes
-        // are Windows VK codes (see keymap / ipc-contract.md §6).
+        // portal mode answers from approved logical shortcut state, without
+        // physical keyboard inspection. Missing keys are stale. Keycodes are
+        // Windows VK codes (see keymap / ipc-contract.md §6).
         "CheckStaleKeys" => {
             let queried: Vec<u64> = payload
                 .get("keycodes")

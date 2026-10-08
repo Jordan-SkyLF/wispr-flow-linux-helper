@@ -1,26 +1,17 @@
-//! Global key capture — the push-to-talk + shortcut-recorder event source.
+//! Shortcut events for Wispr Flow's existing KeypressEvent IPC contract.
 //!
-//! Wispr Flow has no hotkey detection of its own: its renderer "Keyboard
-//! Service" is fed entirely by `KeypressEvent` IPC frames from the helper (the
-//! macOS/Windows helpers supply them via OS key hooks). Without that stream
-//! push-to-talk never fires and the in-app shortcut recorder captures nothing —
-//! the two symptoms share one cause. This module produces the stream.
+//! GlobalShortcuts is the default and fails closed: no keyboard devices are
+//! opened if permission is denied, the portal is absent, or its session ends.
+//! Only approved shortcut chords are synthesized. Unregistered keys are not
+//! visible to the in-app shortcut recorder; configure physical keys in KDE.
 //!
-//! Two backends, selected like [`crate::backend::detect`]:
-//!
-//! - [`xinput`] — XInput2 raw key events on a **true X11** session. Needs no
-//!   device access (no root, no `input` group), works across every X11 WM/DE.
-//!   Not used on Wayland: under XWayland, raw events only cover XWayland's own
-//!   surfaces, not global input.
-//! - [`evdev`] — reads `/dev/input/event*` directly, **below** the display
-//!   server, so it works identically on Wayland and X11. Needs read access to
-//!   the input devices (logind `uaccess` ACL or the `input` group).
-//!
-//! Both translate each press/release to the Windows Virtual-Key code the app
-//! expects (`keymap::evdev_to_vk`) — XInput2 keycodes are evdev codes + 8, so
-//! both paths converge on the same VK and the same emission code here.
+//! Legacy XInput2/evdev remain explicit WISPR_KEY_CAPTURE=xinput|evdev opt-ins.
+//! They are not automatic fallbacks and the packages do not provision evdev
+//! permissions. WISPR_KEY_CAPTURE=none disables global shortcut capture.
 
 mod evdev;
+mod portal;
+mod portal_state;
 mod xinput;
 
 use std::collections::HashSet;
@@ -30,10 +21,10 @@ use serde_json::json;
 
 use crate::backend::EventSink;
 
-/// Query the keys physically held right now (Windows VK codes). Used to answer
-/// `CheckStaleKeys`: a key the app believes is down but that is absent here has
-/// been released (or its device removed) and is stale. The implementation
-/// matches the chosen capture backend (evdev `EVIOCGKEY` vs X11 `QueryKeymap`).
+/// Report held Windows VK codes for `CheckStaleKeys`. Portal mode reports only
+/// active, approved synthetic shortcut chords, not physical keyboard state.
+/// Explicit legacy modes query evdev `EVIOCGKEY` or X11 `QueryKeymap`.
+/// A key absent from this set is stale and may be dropped by the application.
 pub trait HeldKeys {
     fn held_vks(&self) -> HashSet<u32>;
 }
@@ -48,25 +39,38 @@ impl HeldKeys for NoHeldKeys {
     }
 }
 
-/// Start global key capture. Spawns the reader(s) and returns a [`HeldKeys`]
-/// handle for stale-key queries. Prefers the no-privilege XInput2 path on a true
-/// X11 session, falling back to evdev (Wayland, or X11 where XInput2 fails).
+/// Start portal shortcut capture without blocking helper readiness. Raw input
+/// is available only through an explicit legacy mode, never as a fallback.
+/// The returned handle reports synthetic approved-chord state in portal mode.
 pub fn spawn(events: EventSink) -> Box<dyn HeldKeys> {
-    if is_true_x11_session() {
-        match xinput::start(events.clone()) {
-            Ok(held) => {
-                log::info!("key capture: XInput2 (X11, no device access needed)");
-                return held;
+    let mode = std::env::var("WISPR_KEY_CAPTURE").unwrap_or_else(|_| "portal".into());
+    match mode.as_str() {
+        "portal" => match portal::start(events) {
+            Ok(held) => held,
+            Err(error) => {
+                log::error!("GlobalShortcuts unavailable: {error}; no raw-input fallback");
+                Box::new(NoHeldKeys)
             }
-            Err(e) => log::warn!("key capture: XInput2 unavailable ({e}); trying evdev"),
+        },
+        "none" => Box::new(NoHeldKeys),
+        "xinput" if is_true_x11_session() => {
+            log::warn!("Explicit legacy XInput2 mode observes global keystrokes");
+            match xinput::start(events) {
+                Ok(held) => held,
+                Err(error) => {
+                    log::error!("XInput2 unavailable: {error}; no evdev fallback");
+                    Box::new(NoHeldKeys)
+                }
+            }
         }
-    }
-    match evdev::start(events) {
-        Some(held) => {
-            log::info!("key capture: evdev (/dev/input)");
-            held
+        "evdev" => {
+            log::warn!("Explicit legacy evdev mode reads raw keyboard devices");
+            evdev::start(events).unwrap_or_else(|| Box::new(NoHeldKeys))
         }
-        None => Box::new(NoHeldKeys),
+        _ => {
+            log::error!("Unsupported key capture mode/session: {mode}; capture disabled");
+            Box::new(NoHeldKeys)
+        }
     }
 }
 

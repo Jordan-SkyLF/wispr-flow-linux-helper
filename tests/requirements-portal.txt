@@ -1,0 +1,2 @@
+# Test-only dependency for the private D-Bus protocol integration suite.
+dbus-next==0.2.3

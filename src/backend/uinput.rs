@@ -42,7 +42,8 @@ const BUS_USB: u16 = 0x03;
 const KEY_MAX: u16 = 0x2ff;
 
 pub struct UInput {
-    file: File,
+    // Closing this fd destroys the virtual device even after a failed write.
+    file: Option<File>,
 }
 
 impl UInput {
@@ -107,7 +108,7 @@ impl UInput {
         // will route events from it; injecting too early drops the first keys.
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        Ok(UInput { file })
+        Ok(UInput { file: Some(file) })
     }
 
     fn emit(&mut self, type_: u16, code: u16, value: i32) -> Result<()> {
@@ -127,6 +128,8 @@ impl UInput {
             )
         };
         self.file
+            .as_mut()
+            .ok_or("uinput disabled after an injection error; restart Wispr Flow")?
             .write_all(bytes)
             .map_err(|e| format!("uinput write: {e}"))
     }
@@ -153,42 +156,90 @@ impl UInput {
     /// bug, not the fix — verified: 0 ms → modifier applied, ≥8 ms → dropped.
     /// See docs/learnings/wayland-injection.md.
     ///
-    /// Mirrors the Windows helper's GetKeyState dance: any modifier the user is
-    /// *physically* holding at injection time is released first and restored
-    /// afterwards, so e.g. a held Ctrl doesn't turn our injected `v` into a
-    /// stray Ctrl+V (or our injected Ctrl+V into Ctrl+Shift+V). When
-    /// `/dev/input` isn't readable (no `input` group / uaccess ACL), the held
-    /// set is empty and this degrades to a plain chord — see [`held_modifiers`].
+    /// Portal mode never probes physical keyboard state, including at paste
+    /// time. The historical modifier snapshot is only available in explicitly
+    /// selected legacy evdev mode. Release physical shortcut keys before paste.
+    /// On any write/SYN failure, try all outstanding releases and destroy the
+    /// virtual device. Continuing on an uncertain key state risks stuck keys.
     pub fn chord(&mut self, key: u16, mods: &[u16]) -> Result<()> {
         let held = held_modifiers();
-        for &m in &held {
-            let _ = self.key(m, false);
+        let result = inject_chord(key, mods, &held, |code, press| self.key(code, press));
+        if result.is_err() {
+            self.destroy();
         }
-        for &m in mods {
-            self.key(m, true)?;
+        result
+    }
+
+    fn destroy(&mut self) {
+        if let Some(file) = self.file.take() {
+            unsafe { libc::ioctl(file.as_raw_fd(), UI_DEV_DESTROY) };
+            // Dropping the fd is also the kernel's cleanup path if ioctl failed.
         }
-        self.key(key, true)?;
-        self.key(key, false)?;
-        for &m in mods.iter().rev() {
-            self.key(m, false)?;
-        }
-        // Restore physically-held modifiers (reverse order). Best-effort.
-        for &m in held.iter().rev() {
-            let _ = self.key(m, true);
-        }
-        Ok(())
     }
 }
 
-/// Snapshot the modifier keys the user is *physically* holding right now, by
-/// querying every readable `/dev/input/event*` device with `EVIOCGKEY` (a
-/// bitmap of currently-pressed keycodes) and intersecting with the modifier set.
-///
-/// Returns an empty list — and is therefore a no-op for `chord` — when no event
-/// device is readable. Reading `/dev/input` typically needs the `input` group
-/// or the logind `uaccess` ACL; on sessions without it, the snapshot is simply
-/// skipped (the common case at paste time has no modifier held anyway).
+/// Keep emission separately testable so every write/SYN failure boundary can
+/// be exercised without a privileged virtual keyboard. Track before pressing:
+/// the key write may succeed even if its following SYN_REPORT fails.
+fn inject_chord(
+    key: u16,
+    mods: &[u16],
+    held: &[u16],
+    mut emit: impl FnMut(u16, bool) -> Result<()>,
+) -> Result<()> {
+    let mut down = Vec::new();
+    let result = (|| {
+        for &modifier in held {
+            emit(modifier, false)?;
+        }
+        for &modifier in mods {
+            if !down.contains(&modifier) {
+                down.push(modifier);
+                emit(modifier, true)?;
+            }
+        }
+        if !down.contains(&key) {
+            down.push(key);
+        }
+        emit(key, true)?;
+        while let Some(&code) = down.last() {
+            emit(code, false)?;
+            down.pop();
+        }
+        // Retain the legacy snapshot/restore behavior only after a complete
+        // chord; on failure the caller destroys the whole virtual device.
+        for &modifier in held.iter().rev() {
+            down.push(modifier);
+            emit(modifier, true)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        for &code in down.iter().rev() {
+            let _ = emit(code, false);
+        }
+    }
+    result
+}
+
+fn legacy_snapshot(mode: Option<&str>, scan: impl FnOnce() -> Vec<u16>) -> Vec<u16> {
+    if mode == Some("evdev") {
+        scan()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Raw physical state is available only in explicit legacy evdev mode.
+/// Default, portal, none, xinput and invalid modes do not even list /dev/input.
 pub fn held_modifiers() -> Vec<u16> {
+    legacy_snapshot(
+        std::env::var("WISPR_KEY_CAPTURE").ok().as_deref(),
+        scan_modifiers,
+    )
+}
+
+fn scan_modifiers() -> Vec<u16> {
     use std::collections::BTreeSet;
     // EVIOCGKEY(len) = _IOC(_IOC_READ=2, 'E'=0x45, 0x18, len). KEY_MAX=0x2ff ->
     // a 96-byte bitmap covers every keycode we care about.
@@ -235,7 +286,7 @@ pub fn held_modifiers() -> Vec<u16> {
 
 impl Drop for UInput {
     fn drop(&mut self) {
-        unsafe { libc::ioctl(self.file.as_raw_fd(), UI_DEV_DESTROY) };
+        self.destroy();
     }
 }
 
@@ -247,4 +298,83 @@ fn ioctl_set(fd: libc::c_int, req: libc::c_ulong, arg: libc::c_int) -> Result<()
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn physical_snapshot_is_never_called_outside_explicit_evdev() {
+        for mode in [
+            None,
+            Some("portal"),
+            Some("none"),
+            Some("xinput"),
+            Some(""),
+            Some("typo"),
+        ] {
+            assert!(legacy_snapshot(mode, || panic!("physical keyboard read")).is_empty());
+        }
+        assert_eq!(legacy_snapshot(Some("evdev"), || vec![29]), vec![29]);
+    }
+
+    #[test]
+    fn chord_releases_every_key_at_every_failure_boundary() {
+        // Each emit models a successful key write followed by a failing SYN.
+        // It also covers a failing release and verifies the cleanup retries it.
+        for fail_at in 0..6 {
+            let mut held = BTreeSet::new();
+            let mut call = 0;
+            let result = inject_chord(47, &[29, 42], &[], |code, press| {
+                if press {
+                    held.insert(code);
+                } else {
+                    held.remove(&code);
+                }
+                let fail = call == fail_at;
+                call += 1;
+                if fail {
+                    Err("injected write/SYN failure".into())
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.is_err(), "failure point {fail_at}");
+            assert!(held.is_empty(), "stuck key at failure point {fail_at}");
+        }
+    }
+
+    #[test]
+    fn successful_chord_has_no_duplicate_modifiers_and_reverses_release_order() {
+        let mut events = Vec::new();
+        inject_chord(47, &[29, 29, 42], &[], |code, press| {
+            events.push((code, press));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                (29, true),
+                (42, true),
+                (47, true),
+                (47, false),
+                (42, false),
+                (29, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_device_is_closed_and_cannot_accept_another_chord() {
+        // /dev/full is an unprivileged kernel ENOSPC sink, not an input device.
+        let mut input = UInput {
+            file: Some(OpenOptions::new().write(true).open("/dev/full").unwrap()),
+        };
+        assert!(input.chord(47, &[29]).is_err());
+        assert!(input.file.is_none());
+        assert!(input.chord(47, &[29]).is_err());
+    }
 }
