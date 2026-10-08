@@ -19,20 +19,20 @@ mod proto;
 use std::io::{Read, Write};
 use std::os::unix::io::FromRawFd;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use backend::Backend;
 use proto::{Incoming, Kind};
 
-/// Handle to the fd-3 IPC return channel. Cheaply cloneable; every send is
+/// Handle to the fd-3 IPC return channel. Every send is
 /// queued to the single writer thread (see [`spawn_fd3_writer`]), so responses
 /// and async helper-initiated events can be emitted from any thread without
 /// interleaving a frame.
-#[derive(Clone)]
 struct IpcWriter {
     tx: mpsc::Sender<Value>,
+    drained: mpsc::Receiver<()>,
 }
 
 impl IpcWriter {
@@ -41,16 +41,42 @@ impl IpcWriter {
             log::error!("fd3 writer thread gone — dropping message");
         }
     }
+
+    fn drain_before_exit(&self) {
+        // Only object envelopes go on the wire. An internal null marker uses
+        // the same FIFO as events and ACKs, so its completion proves every
+        // earlier cleanup frame was written. Do not join on channel closure:
+        // background providers retain senders, and a stalled parent may never
+        // read fd 3 again.
+        if self.tx.send(Value::Null).is_err() {
+            log::warn!("fd3 writer unavailable; shutdown cleanup delivery is unconfirmed");
+            return;
+        }
+        if let Err(error) = self.drained.recv_timeout(Duration::from_secs(1)) {
+            log::warn!(
+                "fd3 shutdown drain did not complete ({error}); cleanup delivery is unconfirmed"
+            );
+        }
+    }
 }
 
 /// Spawn the sole owner of fd 3: drains the channel, encodes each envelope, and
 /// writes+flushes it. fd 3 is created by the parent (Electron spawns the helper
 /// with a 4th "pipe" stdio entry); we take exclusive ownership for the process
 /// lifetime and never touch fds 0/1/2 here.
-fn spawn_fd3_writer(rx: mpsc::Receiver<Value>) -> std::thread::JoinHandle<()> {
+fn spawn_fd3_writer(
+    rx: mpsc::Receiver<Value>,
+    drained: mpsc::Sender<()>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut file = unsafe { std::fs::File::from_raw_fd(3) };
         for envelope in rx {
+            if envelope.is_null() {
+                let _ = drained.send(());
+                // This is a terminal barrier: later provider events must not
+                // start another frame while the main thread is exiting.
+                break;
+            }
             match proto::encode(&envelope) {
                 Ok(frame) => {
                     if let Err(e) = file.write_all(&frame).and_then(|_| file.flush()) {
@@ -88,12 +114,17 @@ fn main() {
     );
 
     let (tx, rx) = mpsc::channel::<Value>();
-    let _writer = spawn_fd3_writer(rx);
-    let ipc = IpcWriter { tx: tx.clone() };
-    // Global key capture: streams `KeypressEvent`s on fd 3 so push-to-talk and
-    // the in-app shortcut recorder work (the app has no hotkey detection of its
-    // own — see capture/mod.rs). XInput2 on X11, evdev elsewhere. The returned
-    // handle answers `CheckStaleKeys`. Independent of the focus/injection backend.
+    let (drained_tx, drained) = mpsc::channel();
+    let _writer = spawn_fd3_writer(rx, drained_tx);
+    let ipc = IpcWriter {
+        tx: tx.clone(),
+        drained,
+    };
+    // Stream `KeypressEvent`s on fd 3 to the app's existing keyboard handler.
+    // Portal capture emits configured logical actions only; it cannot record
+    // arbitrary physical keys. XInput2 on true X11 and explicit legacy evdev
+    // retain recorder events. The returned handle answers `CheckStaleKeys`,
+    // independently of the focus/injection backend.
     let held_keys = capture::spawn(tx.clone());
     // The backend gets its own sink for async helper-initiated events (focus).
     let mut be = backend::detect(tx);
@@ -103,15 +134,17 @@ fn main() {
     let mut stdin = std::io::stdin();
     let mut chunk = [0u8; 8192];
 
-    loop {
+    'requests: loop {
         let n = match stdin.read(&mut chunk) {
             Ok(0) => {
                 log::info!("stdin closed (EOF) — shutting down");
+                held_keys.shutdown();
                 break;
             }
             Ok(n) => n,
             Err(e) => {
                 log::error!("stdin read error: {e}");
+                held_keys.shutdown();
                 break;
             }
         };
@@ -123,12 +156,15 @@ fn main() {
                         log::debug!("<- response {} uuid={}", msg.command, msg.uuid);
                         continue;
                     }
-                    handle_request(&mut *be, held_keys.as_ref(), &ipc, &msg, started);
+                    if handle_request(&mut *be, held_keys.as_ref(), &ipc, &msg, started) {
+                        break 'requests;
+                    }
                 }
                 Err(e) => log::error!("failed to parse message: {e}; body={body:?}"),
             }
         }
     }
+    ipc.drain_before_exit();
 }
 
 fn handle_request(
@@ -137,10 +173,19 @@ fn handle_request(
     ipc: &IpcWriter,
     msg: &Incoming,
     started: Instant,
-) {
+) -> bool {
     let uuid = msg.uuid.as_str();
     // payload-bearing commands wrap their data under `.payload`
     let payload = msg.payload.get("payload").cloned().unwrap_or(Value::Null);
+    if matches!(msg.command.as_str(), "PasteText" | "SimulateKeyPress")
+        && !capture::injection_allowed()
+    {
+        ipc.send(&proto::error(
+            "Insertion blocked: portal capture is pending or failed; approve shortcuts or restart Wispr Flow after correcting the portal fault",
+            uuid,
+        ));
+        return false;
+    }
 
     match msg.command.as_str() {
         // ---- readiness / keepalive ----
@@ -162,7 +207,10 @@ fn handle_request(
             let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
             let html = payload.get("htmlText").and_then(Value::as_str).filter(|s| !s.is_empty());
             match be.paste_text(text, html) {
-                Ok(()) => ipc.send(&proto::ack(uuid)),
+                Ok(()) => {
+                    held_keys.paste_completed();
+                    ipc.send(&proto::ack(uuid));
+                },
                 Err(e) => {
                     log::error!("PasteText failed: {e}");
                     ipc.send(&proto::error(&format!("PasteText failed: {e}"), uuid));
@@ -253,10 +301,10 @@ fn handle_request(
         }
 
         // ---- stale-key recovery ----
-        // The app polls this every ~5s with the keycodes it believes are held;
-        // we answer with the subset that is NOT physically held right now (so it
-        // can drop keys stuck by a missed release / unplugged device). Keycodes
-        // are Windows VK codes (see keymap / ipc-contract.md §6).
+        // The app polls this every ~5s with keys it believes are held. Return
+        // those absent from the capture backend's current logical state. Portal
+        // mode knows approved action state, not the physical keyboard; it never
+        // queries devices to answer this request. Keycodes are Windows VK codes.
         "CheckStaleKeys" => {
             let queried: Vec<u64> = payload
                 .get("keycodes")
@@ -276,10 +324,21 @@ fn handle_request(
         }
 
         // ---- lifecycle ----
+        "DictationStart" | "RecordingStarted" => {
+            held_keys.dictation_started();
+            ipc.send(&proto::ack(uuid));
+        }
+        "UpdateShortcuts" => {
+            // The actual app sends no shortcut payload. Read its persisted
+            // settings promptly; the periodic watcher covers external changes.
+            held_keys.shortcuts_changed();
+            ipc.send(&proto::ack(uuid));
+        }
         "HelperAppShutdown" => {
+            held_keys.shutdown();
             log::info!("HelperAppShutdown received — exiting");
             ipc.send(&proto::ack(uuid));
-            std::process::exit(0);
+            return true;
         }
 
         // ---- everything else: safe no-op ACK ----
@@ -291,4 +350,5 @@ fn handle_request(
             ipc.send(&proto::ack(uuid));
         }
     }
+    false
 }

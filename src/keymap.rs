@@ -460,7 +460,12 @@ pub fn chord_to_xdg_trigger(vks: &[u32]) -> Option<String> {
     // A trigger must have exactly one base key; modifier-only is rejected by KDE.
     let key = key?;
     let mut parts: Vec<&str> = Vec::new();
-    for (on, name) in [(ctrl, "CTRL"), (alt, "ALT"), (shift, "SHIFT"), (logo, "LOGO")] {
+    for (on, name) in [
+        (ctrl, "CTRL"),
+        (alt, "ALT"),
+        (shift, "SHIFT"),
+        (logo, "LOGO"),
+    ] {
         if on {
             parts.push(name);
         }

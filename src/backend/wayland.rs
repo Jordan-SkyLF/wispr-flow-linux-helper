@@ -16,10 +16,10 @@
 //! compositor-specific D-Bus/portal calls):
 //!   * GetActiveAppInfo / GetRunningApps — no portable protocol; returns empty.
 //!     KDE could be wired via KWin D-Bus and GNOME via a shell extension later.
-//!   * Held-modifier snapshot/release (the Windows helper's GetKeyState dance)
-//!     needs reading /dev/input; not done yet (TODO).
-//!   * Simultaneous text/plain + text/html clipboard offer (wl-copy sets one
-//!     payload); we offer plain text, which is what paste targets read (TODO).
+//!
+//! Physical modifier snapshots are disabled outside explicit legacy evdev.
+//! Use a bare physical portal trigger and release other modifiers before paste.
+//! Rich clipboard offers use ext-data-control where supported.
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -116,8 +116,6 @@ impl Backend for WaylandBackend {
             .iter()
             .filter_map(|f| keymap::flag_to_evdev(f))
             .collect();
-        // TODO: snapshot & release physically-held modifiers around injection
-        // (mirrors the Windows helper's GetKeyState dance); needs /dev/input read.
         self.uinput.chord(key, &mods)
     }
 

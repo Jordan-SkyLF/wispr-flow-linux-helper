@@ -1,8 +1,8 @@
 [package]
 name = "wispr-flow-linux-helper"
-version = "0.1.2"
+version = "0.1.2+hybrid.1"
 edition = "2021"
-description = "Clean-room Linux helper for Wispr Flow: speaks the helper IPC contract over stdin (commands) / fd 3 (events) and backs the OS-integration commands with X11 (Wayland later)."
+description = "Clean-room Linux helper for Wispr Flow with portal capture on Wayland, XInput2 on X11, and the existing stdin/fd-3 IPC contract."
 license = "Unlicense"
 
 # Produces a single binary `wispr-flow-linux-helper` that drops into the app's
@@ -27,9 +27,8 @@ log = "0.4"
 env_logger = "0.11"
 # D-Bus (pure-Rust, no libdbus) for the KDE/KWin active-window bridge: host a
 # tiny service that a KWin script pushes windowActivated events to, and call
-# org.kde.kwin.Scripting to load it. Blocking API matches the helper's threading.
-# Same crate family the `atspi` selection work will use later. Default features
-# include the async-io runtime + the blocking API used here.
+# org.kde.kwin.Scripting to load it. Services and portal capture use async zbus
+# on a live Tokio runtime (D-008); atspi shares the same zbus 4 dependency.
 zbus = "4"
 # In-process Wayland clipboard owner (backend::wl_clipboard): offer text/plain +
 # text/html simultaneously via the focus-free ext-data-control protocol, instead
@@ -44,8 +43,8 @@ wayland-protocols = { version = "0.32", features = ["staging", "client"] }
 # The `tokio` feature is mandatory (atspi requires an async runtime); we drive it
 # from a tiny per-call current-thread runtime, so only `rt` + `time` are needed.
 atspi = { version = "0.22", default-features = false, features = ["proxies", "connection", "tokio"] }
-# `macros` adds tokio::select! (the portal backend multiplexes the Activated /
-# Deactivated signal streams against a config-mtime poll on one runtime thread).
+# `macros` adds tokio::select! (the portal backend multiplexes an ordered
+# signal stream with configuration and held-action deadline checks).
 tokio = { version = "1", features = ["rt", "time", "macros"] }
 # Stream combinators (StreamExt::next) for the zbus signal streams the
 # GlobalShortcuts portal backend consumes. Already in-tree via zbus.

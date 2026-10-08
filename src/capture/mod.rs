@@ -1,48 +1,44 @@
-//! Global key capture — the push-to-talk + shortcut-recorder event source.
-//!
-//! Wispr Flow has no hotkey detection of its own: its renderer "Keyboard
-//! Service" is fed entirely by `KeypressEvent` IPC frames from the helper (the
-//! macOS/Windows helpers supply them via OS key hooks). Without that stream
-//! push-to-talk never fires and the in-app shortcut recorder captures nothing —
-//! the two symptoms share one cause. This module produces the stream.
-//!
-//! Two backends, selected like [`crate::backend::detect`]:
-//!
-//! - [`xinput`] — XInput2 raw key events on a **true X11** session. Needs no
-//!   device access (no root, no `input` group), works across every X11 WM/DE.
-//!   Not used on Wayland: under XWayland, raw events only cover XWayland's own
-//!   surfaces, not global input.
-//! - [`evdev`] — reads `/dev/input/event*` directly, **below** the display
-//!   server, so it works identically on Wayland and X11. Needs read access to
-//!   the input devices (logind `uaccess` ACL or the `input` group).
-//!
-//! Both translate each press/release to the Windows Virtual-Key code the app
-//! expects (`keymap::evdev_to_vk`) — XInput2 keycodes are evdev codes + 8, so
-//! both paths converge on the same VK and the same emission code here.
+//! Capture is separate from injection: portal on Wayland, XInput2 on true X11.
+//! Physical evdev monitoring requires an explicit opt-in, never a fallback.
 
 mod config;
 mod evdev;
 mod portal;
+mod portal_state;
 mod xinput;
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use serde_json::json;
-
 use crate::backend::EventSink;
+use serde_json::json;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
-/// Query the keys physically held right now (Windows VK codes). Used to answer
-/// `CheckStaleKeys`: a key the app believes is down but that is absent here has
-/// been released (or its device removed) and is stale. The implementation
-/// matches the chosen capture backend (evdev `EVIOCGKEY` vs X11 `QueryKeymap`).
-pub trait HeldKeys {
-    fn held_vks(&self) -> HashSet<u32>;
+// Block insertion before fault cancellation reaches the app, including a
+// transcription request already in flight. Only initial portal approval opens
+// this gate; a terminal portal fault never retries within this process.
+// 0 = awaiting initial approval; 1 = permitted; 2 = terminal failure.
+static INJECTION_STATE: AtomicU8 = AtomicU8::new(1);
+pub(crate) fn injection_allowed() -> bool {
+    INJECTION_STATE.load(Ordering::Acquire) == 1
+}
+pub(super) fn block_injection() {
+    INJECTION_STATE.store(2, Ordering::Release);
+}
+fn await_portal_approval() {
+    let _ = INJECTION_STATE.compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire);
+}
+pub(super) fn allow_injection() {
+    // An approval racing shutdown/failure must never reopen a terminal gate.
+    let _ = INJECTION_STATE.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
 }
 
-/// A held-keys querier that always reports nothing — used when no capture
-/// backend is available (every queried key then reads as stale, which is the
-/// safe answer: the app drops keys it can't confirm are held).
+pub trait HeldKeys {
+    fn held_vks(&self) -> HashSet<u32>;
+    // DictationStop is not completion: processing and paste may follow.
+    fn dictation_started(&self) {}
+    fn paste_completed(&self) {}
+    fn shortcuts_changed(&self) {}
+    fn shutdown(&self) {}
+}
 struct NoHeldKeys;
 impl HeldKeys for NoHeldKeys {
     fn held_vks(&self) -> HashSet<u32> {
@@ -50,115 +46,108 @@ impl HeldKeys for NoHeldKeys {
     }
 }
 
-/// Which Wayland capture backend to use, from `WISPR_CAPTURE`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureMode {
-    /// `org.freedesktop.portal.GlobalShortcuts` — the default. Compositor-
-    /// mediated, no device access, not a keylogging surface.
     Portal,
-    /// `/dev/input` reader — the explicit opt-in for compositors without portal
-    /// support (wlroots/sway). Requires device read access; see [`evdev`].
+    X11,
     Evdev,
+    None,
 }
 
-/// Parse the `WISPR_CAPTURE` override. Default is [`CaptureMode::Portal`]; only
-/// `evdev` selects the device-reading path. Unknown values warn and default.
-/// (The variable is Wayland-scoped — X11 always uses the no-privilege XInput2
-/// path, so it's ignored there.)
-fn capture_mode() -> CaptureMode {
-    match std::env::var("WISPR_CAPTURE").ok().as_deref() {
-        Some("evdev") => CaptureMode::Evdev,
-        Some("portal") | None => CaptureMode::Portal,
-        Some("") => CaptureMode::Portal,
-        Some(other) => {
-            log::warn!("WISPR_CAPTURE={other:?} not recognized; using the portal default");
+fn resolve_mode(
+    canonical: Option<&str>,
+    legacy: Option<&str>,
+    display: Option<&str>,
+    wayland: Option<&str>,
+    session: Option<&str>,
+) -> Result<CaptureMode, String> {
+    let value = canonical.or(legacy).unwrap_or("auto");
+    let is_wayland = session == Some("wayland") || wayland.is_some_and(|s| !s.is_empty());
+    let is_x11 = !is_wayland && display.is_some_and(|s| !s.is_empty());
+    match value {
+        "auto" => Ok(if is_wayland {
             CaptureMode::Portal
-        }
+        } else if is_x11 {
+            CaptureMode::X11
+        } else {
+            CaptureMode::None
+        }),
+        "portal" => Ok(CaptureMode::Portal),
+        "evdev" => Ok(CaptureMode::Evdev),
+        "none" => Ok(CaptureMode::None),
+        "x11" if is_x11 => Ok(CaptureMode::X11),
+        "xinput" if canonical.is_none() && is_x11 => Ok(CaptureMode::X11),
+        "x11" | "xinput" => Err("XInput2 requires a true X11 session and WISPR_CAPTURE=x11".into()),
+        other => Err(format!(
+            "unknown capture mode {other:?}; use WISPR_CAPTURE=auto|portal|x11|evdev|none"
+        )),
     }
 }
-
-/// Start global key capture. Spawns the reader(s) and returns a [`HeldKeys`]
-/// handle for stale-key queries. The backend is chosen per session:
-///
-/// - **true X11** — XInput2 (no device access), falling back to evdev.
-/// - **Wayland** — the GlobalShortcuts portal by default, or evdev when
-///   `WISPR_CAPTURE=evdev`. Portal failure does **not** fall back to evdev
-///   (that would silently reintroduce the device-read surface the default
-///   avoids); it logs and leaves capture off until the user opts in.
-/// - **headless / other** — evdev, the only session-agnostic option.
+fn configured_mode() -> Result<CaptureMode, String> {
+    resolve_mode(
+        std::env::var("WISPR_CAPTURE").ok().as_deref(),
+        std::env::var("WISPR_KEY_CAPTURE").ok().as_deref(),
+        std::env::var("DISPLAY").ok().as_deref(),
+        std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+        std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+    )
+}
+/// Paste-time modifier snapshots must honor the same explicit opt-in.
+pub(crate) fn physical_input_allowed() -> bool {
+    configured_mode() == Ok(CaptureMode::Evdev)
+}
 pub fn spawn(events: EventSink) -> Box<dyn HeldKeys> {
-    if is_true_x11_session() {
-        match xinput::start(events.clone()) {
-            Ok(held) => {
-                log::info!("key capture: XInput2 (X11, no device access needed)");
-                return held;
-            }
-            Err(e) => log::warn!("key capture: XInput2 unavailable ({e}); trying evdev"),
-        }
-        return start_evdev(events);
+    if std::env::var_os("WISPR_KEY_CAPTURE").is_some() {
+        log::warn!("WISPR_KEY_CAPTURE is deprecated; migrate to WISPR_CAPTURE. Canonical wins if both are set; xinput becomes x11.");
     }
-
-    if is_wayland_session() {
-        return match capture_mode() {
-            CaptureMode::Portal => match portal::start(events) {
+    if std::env::var_os("WISPR_PORTAL_SHORTCUTS").is_some() {
+        log::warn!("WISPR_PORTAL_SHORTCUTS is obsolete and ignored. Wispr settings own logical chords; KDE owns physical shortcuts.");
+    }
+    match configured_mode() {
+        Ok(CaptureMode::Portal) => {
+            await_portal_approval();
+            match portal::start(events) {
                 Ok(held) => held,
                 Err(e) => {
-                    log::error!(
-                        "key capture: GlobalShortcuts portal unavailable ({e}). \
-                         Push-to-talk and the shortcut recorder are OFF. If your \
-                         compositor has no portal support (e.g. sway/wlroots), set \
-                         WISPR_CAPTURE=evdev to use the device-reading fallback."
-                    );
+                    log::error!("portal capture disabled: {e}; fix configuration and restart Wispr Flow. No raw-input fallback.");
                     Box::new(NoHeldKeys)
                 }
-            },
-            CaptureMode::Evdev => {
-                log::info!("key capture: evdev (WISPR_CAPTURE=evdev)");
-                start_evdev(events)
             }
-        };
-    }
-
-    // Headless / unknown session: evdev is the only thing that can work.
-    start_evdev(events)
-}
-
-/// evdev start with the no-readable-device case folded into [`NoHeldKeys`].
-fn start_evdev(events: EventSink) -> Box<dyn HeldKeys> {
-    match evdev::start(events) {
-        Some(held) => {
-            log::info!("key capture: evdev (/dev/input)");
-            held
         }
-        None => Box::new(NoHeldKeys),
+        Ok(CaptureMode::X11) => match xinput::start(events) {
+            Ok(held) => {
+                log::info!("key capture: XInput2 (true X11)");
+                held
+            }
+            Err(e) => {
+                log::error!("XInput2 capture disabled: {e}; no evdev fallback");
+                Box::new(NoHeldKeys)
+            }
+        },
+        Ok(CaptureMode::Evdev) => {
+            log::warn!("key capture: explicit legacy evdev; physical keyboard reads are enabled");
+            evdev::start(events).unwrap_or_else(|| Box::new(NoHeldKeys))
+        }
+        Ok(CaptureMode::None) => {
+            log::info!("key capture: disabled (no physical keyboard reads)");
+            Box::new(NoHeldKeys)
+        }
+        Err(e) => {
+            block_injection();
+            log::error!("capture and insertion disabled: {e}");
+            Box::new(NoHeldKeys)
+        }
     }
 }
 
-/// True on an X11 session but not Wayland. On Wayland `DISPLAY` is usually also
-/// set (XWayland), so require `WAYLAND_DISPLAY` to be absent.
-fn is_true_x11_session() -> bool {
-    std::env::var_os("DISPLAY").is_some() && std::env::var_os("WAYLAND_DISPLAY").is_none()
-}
-
-/// True on a Wayland session (`WAYLAND_DISPLAY` set), where the portal is the
-/// default capture path.
-fn is_wayland_session() -> bool {
-    std::env::var_os("WAYLAND_DISPLAY").is_some()
-}
-
-/// Emit one `KeypressEvent` on fd 3. `index` is a process-wide monotonic
-/// sequence the app cross-checks against its own counter (it warns on a gap), so
-/// every backend shares a single counter regardless of how many readers feed it.
 fn emit_keypress(events: &EventSink, index: &AtomicU64, pid: u32, vk: u32, press: bool) {
     let idx = index.fetch_add(1, Ordering::Relaxed) + 1;
     let env = crate::proto::request(
         "KeypressEvent",
         json!({ "payload": {
             "eventType": if press { "key_event_press" } else { "key_event_release" },
-            "key": vk,
-            "index": idx,
-            "inputType": "keyboard",
-        } }),
+            "key": vk, "index": idx, "inputType": "keyboard",
+        }}),
         &format!("kp-{pid}-{idx}"),
     );
     let _ = events.send(env);
@@ -167,61 +156,73 @@ fn emit_keypress(events: &EventSink, index: &AtomicU64, pid: u32, vk: u32, press
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // The exact `KeypressEvent` frame shape is the contract the app's keyboard
-    // service decodes; pin it so silent protocol drift fails the build.
     #[test]
-    fn emit_keypress_builds_keypress_event_frame() {
+    fn capture_never_infers_evdev_or_uses_xwayland_as_x11() {
+        assert_eq!(
+            resolve_mode(None, None, None, None, None),
+            Ok(CaptureMode::None)
+        );
+        assert_eq!(
+            resolve_mode(None, None, Some(":0"), None, None),
+            Ok(CaptureMode::X11)
+        );
+        assert_eq!(
+            resolve_mode(None, None, Some(":0"), Some("wayland-0"), None),
+            Ok(CaptureMode::Portal)
+        );
+        assert_eq!(
+            resolve_mode(None, None, Some(":0"), Some(""), Some("wayland")),
+            Ok(CaptureMode::Portal)
+        );
+        assert_eq!(
+            resolve_mode(None, None, Some(""), Some(""), None),
+            Ok(CaptureMode::None)
+        );
+        assert!(resolve_mode(Some("x11"), None, Some(":0"), Some("wayland-0"), None).is_err());
+        assert!(resolve_mode(Some("typo"), Some("evdev"), None, None, None).is_err());
+        assert!(resolve_mode(Some(""), Some("evdev"), None, None, None).is_err());
+    }
+    #[test]
+    fn modes_and_legacy_migration_have_unambiguous_precedence() {
+        assert_eq!(
+            resolve_mode(Some("evdev"), None, None, None, None),
+            Ok(CaptureMode::Evdev)
+        );
+        assert_eq!(
+            resolve_mode(None, Some("evdev"), None, None, None),
+            Ok(CaptureMode::Evdev)
+        );
+        assert_eq!(
+            resolve_mode(Some("portal"), Some("evdev"), None, None, None),
+            Ok(CaptureMode::Portal)
+        );
+        assert_eq!(
+            resolve_mode(None, Some("xinput"), Some(":0"), None, None),
+            Ok(CaptureMode::X11)
+        );
+        assert!(resolve_mode(Some("xinput"), None, Some(":0"), None, None).is_err());
+        assert_eq!(
+            resolve_mode(Some("none"), Some("evdev"), Some(":0"), None, None),
+            Ok(CaptureMode::None)
+        );
+    }
+    #[test]
+    fn keypress_frames_keep_the_wispr_contract() {
         let (tx, rx) = std::sync::mpsc::channel();
         let index = AtomicU64::new(0);
-
         emit_keypress(&tx, &index, 4242, 65, true);
         emit_keypress(&tx, &index, 4242, 65, false);
-
-        let press = rx.recv().expect("press frame");
-        let kp = &press["HelperAPIRequest"]["KeypressEvent"]["payload"];
-        assert_eq!(kp["eventType"], "key_event_press");
-        assert_eq!(kp["key"], 65);
-        assert_eq!(kp["index"], 1); // counter starts at 1, not 0
-        assert_eq!(kp["inputType"], "keyboard");
+        let press = rx.recv().unwrap();
+        let key = &press["HelperAPIRequest"]["KeypressEvent"]["payload"];
+        assert_eq!(key["eventType"], "key_event_press");
+        assert_eq!(key["key"], 65);
+        assert_eq!(key["index"], 1);
+        assert_eq!(key["inputType"], "keyboard");
         assert_eq!(press["HelperAPIRequest"]["uuid"], "kp-4242-1");
-
-        let release = rx.recv().expect("release frame");
-        let kp = &release["HelperAPIRequest"]["KeypressEvent"]["payload"];
-        assert_eq!(kp["eventType"], "key_event_release");
-        assert_eq!(kp["index"], 2); // shared monotonic counter advances
-        assert_eq!(release["HelperAPIRequest"]["uuid"], "kp-4242-2");
-    }
-
-    // XInput2 is chosen only on a true X11 session: DISPLAY set and
-    // WAYLAND_DISPLAY absent (under XWayland DISPLAY is also set, so its presence
-    // alone must not select the X11 path).
-    #[test]
-    fn true_x11_requires_display_without_wayland() {
-        // Snapshot + restore so the test leaves the process env untouched. No
-        // other test reads these vars, so owning them here is race-free.
-        let saved_display = std::env::var_os("DISPLAY");
-        let saved_wayland = std::env::var_os("WAYLAND_DISPLAY");
-        let restore = |key: &str, val: &Option<std::ffi::OsString>| match val {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        };
-
-        // X11: DISPLAY set, no WAYLAND_DISPLAY.
-        std::env::set_var("DISPLAY", ":0");
-        std::env::remove_var("WAYLAND_DISPLAY");
-        assert!(is_true_x11_session());
-
-        // Wayland with XWayland: both set -> not a true X11 session.
-        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
-        assert!(!is_true_x11_session());
-
-        // Headless: neither set.
-        std::env::remove_var("DISPLAY");
-        std::env::remove_var("WAYLAND_DISPLAY");
-        assert!(!is_true_x11_session());
-
-        restore("DISPLAY", &saved_display);
-        restore("WAYLAND_DISPLAY", &saved_wayland);
+        let release = rx.recv().unwrap();
+        assert_eq!(
+            release["HelperAPIRequest"]["KeypressEvent"]["payload"]["index"],
+            2
+        );
     }
 }

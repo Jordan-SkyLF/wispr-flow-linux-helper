@@ -1,5 +1,7 @@
 # Rust build output (Cargo.lock IS committed — this is a binary crate)
 /target
+**/__pycache__/
+.venv/
 
 # Backtraces / cargo cruft
 **/*.rs.bk

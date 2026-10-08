@@ -1,141 +1,165 @@
-# wispr-flow-linux-helper
+# Wispr Flow Linux helper — portal hybrid
 
-> Standalone repo (`github.com/wispr-flow-linux/helper`), split out of the
-> `wispr-flow-linux` monorepo. Tagged `v*` releases publish prebuilt
-> `wispr-flow-linux-helper-x86_64` and `wispr-flow-linux-helper-aarch64`
-> binaries as Release assets, which the main `wispr-flow-linux` package build
-> downloads instead of compiling the helper itself.
+This private successor branch adapts the upstream asynchronous GlobalShortcuts
+implementation for KDE Plasma on Wayland. It retains Wispr's stdin/fd-3 helper
+protocol, its saved logical shortcuts, Tokio/zbus, the uinput insertion backend,
+and XInput2 capture on true X11 sessions. It selectively imports lifecycle,
+physical-input protections, and failed-device recovery from the earlier
+`feature/portal-shortcuts` experiment.
 
-Clean-room Linux helper for Wispr Flow. It is a standalone process that speaks the
-helper IPC contract the Wispr Flow Electron app already uses for its macOS (Swift)
-and Windows (C#) helpers, and backs the OS-integration commands with **X11 and
-Wayland** backends. The app ships no Linux helper; this fills that gap.
+The target is a candidate for CachyOS desktop acceptance. Automated protocol and
+application-handler tests do not establish microphone, transcription, clipboard,
+or desktop insertion behavior. Earlier upstream live tests do not validate this
+hybrid. The previous feature branch remains a rollback option.
 
-The Wayland backend injects via an **in-process `/dev/uinput` virtual keyboard**
-(no `ydotoold` daemon, no root — just `/dev/uinput` write access from the logind
-`uaccess` ACL) + `wl-clipboard`. **`PasteText` is live-validated** inserting text
-into a focused native KDE Plasma Wayland app.
+The packaging repository contains the recovered
+[IPC contract](https://github.com/Jordan-SkyLF/wispr-flow-linux/blob/feature/portal-hybrid/docs/reference/ipc-contract.md),
+[build and configuration guide](https://github.com/Jordan-SkyLF/wispr-flow-linux/blob/feature/portal-hybrid/docs/portal-hybrid.md),
+and the candidate's exact source and validation handoff. No proprietary Wispr
+application code is included in this repository.
 
-**Contract is the source of truth:**
-[`docs/reference/ipc-contract.md`](https://github.com/wispr-flow-linux/wispr-flow-linux/blob/main/docs/reference/ipc-contract.md)
-(+ `keycodes.json`, `commands.json`), kept in the main `wispr-flow-linux` repo.
-Recovered directly from the shipped Electron bundle — not guessed.
+## Shortcut ownership
 
-## What works
+Wispr's saved PTT and Dismiss bindings are the **logical** actions.
+The helper reads the application's existing settings and emits the same Windows
+VK `KeypressEvent` messages as the original helpers. KDE owns the **physical**
+shortcuts, approval, and persistence.
 
-| Command | X11 backend | Wayland backend |
-|---|---|---|
-| `IsReady` → `ACK` | ✅ handshake + keepalive | ✅ |
-| `PasteText` | ✅ clipboard (`xclip`/`xsel`) + XTEST Ctrl+V | ✅ **live-validated** — in-process text/plain+text/html clipboard + uinput Ctrl+V |
-| `SimulateKeyPress` | ✅ VK→keysym→keycode + XTEST | ✅ VK→evdev + uinput chord (held-modifier snapshot/release) |
-| `GetActiveAppInfo` / `GetAppInfo` | ✅ `_NET_ACTIVE_WINDOW`→PID/`WM_CLASS` | ✅ **KDE** via KWin script bridge; ⬜ other compositors |
-| `GetRunningApps` | ✅ `_NET_CLIENT_LIST` | ⚠️ KDE: active app only (full list TBD); ⬜ other |
-| `SetFocusChangeDetectorState` → `AppInfoUpdate` | ⬜ (TODO: `PropertyNotify`) | ✅ **KDE** — focus events on fd 3, gated & deduped |
-| `GetSelectedTextViaCopy` | ⚠️ Ctrl+C copy-probe | ⚠️ Ctrl+C copy-probe |
-| `GetAccessibilityStatus` | ✅ (connection live) | ✅ (uinput live) |
-| everything else (intervals/BLE/panel/analytics…) | ACK no-op | ACK no-op |
+For example, KDE can approve F8 for push-to-talk while the helper emits Wispr's
+Ctrl+Meta logical chord. Modifier-only logical chords are supported; they are
+not offered as modifier-only portal triggers. A suitable existing bare function
+key is used as an initial suggestion where possible; otherwise the suggestions
+are F8 and F9. They are editable suggestions, not fixed requirements.
 
-`detect()` picks Wayland when `$WAYLAND_DISPLAY` is set and `/dev/uinput` is
-writable, else X11 (`$DISPLAY`), else a no-op stub.
+Logical changes are read before activation, after the consent dialog, on the
+application's `UpdateShortcuts` command, and by periodic content comparison.
+Idle logical changes do not overwrite KDE's physical choices. Changes during
+recording or possible processing cancel and disable capture until restart.
 
-Design choice: unhandled commands are ACK'd as safe no-ops so the unmodified app
-stays healthy instead of relaunch-looping the helper. See `src/main.rs` dispatch.
+The portal cannot observe arbitrary keys for Wispr's in-app shortcut recorder.
+Use KDE's approved-shortcut controls to change physical triggers. Saved, synced,
+or reset logical settings still propagate. Missing or invalid settings keep
+capture and insertion off with an actionable diagnostic; the helper does not
+translate incompatible macOS codes or substitute an unrelated cancellation
+action. Fresh users must finish Wispr setup so it writes valid settings.
 
-## Build
+## Capture configuration
 
-Needs a Rust toolchain (not currently installed on this machine):
+| `WISPR_CAPTURE` | Behavior |
+| --- | --- |
+| unset or `auto` | Portal on Wayland; XInput2 on true X11; no capture headlessly. |
+| `portal` | Portal capture only. Failure never selects evdev. |
+| `x11` | XInput2, accepted only on a true X11 session. |
+| `evdev` | Explicit legacy physical keyboard monitoring, including paste-time modifier scans. Requires separately arranged device access. |
+| `none` | No shortcut capture. Intended for diagnostics or deliberate manual operation. |
+
+Unknown or explicitly empty modes disable capture and insertion. An XWayland
+`DISPLAY` does not qualify as a true X11 session. The deprecated
+`WISPR_KEY_CAPTURE` variable is recognized only when `WISPR_CAPTURE` is absent;
+its old `xinput` spelling maps to `x11`. The canonical variable wins if both
+exist. Remove obsolete `WISPR_PORTAL_SHORTCUTS` JSON; it is ignored rather than
+maintained as a second logical configuration.
+
+`WISPR_PORTAL_APP_ID` defaults to `ai.wisprflow.Flow`, paired with
+`ai.wisprflow.Flow.desktop` in packages and AppImages. Host Registry registration
+uses the same D-Bus connection as the shortcut session. A missing Registry
+interface produces a warning to launch from the installed desktop entry and
+verify identity. Other registration failures disable capture. Changing this ID
+can change KDE's stored permission and shortcut association.
+
+## Failure behavior and security boundary
+
+Portal messages are checked against the pinned unique service owner, interface,
+path, session, and approved action ID. Requests use the returned handle path.
+An ordered stream and small action state machine handle duplicate activations,
+zero/equal/non-monotonic timestamps, early responses, and binding changes.
+An empty or `none` trigger description is not an active binding. Registration,
+the first received activation, and actual dictation are separate observations.
+
+Denial, owner replacement, disconnection, session closure, active binding loss,
+or a change during possible recording/processing closes the insertion gate
+before cleanup. For unchanged settings, logical Dismiss precedes PTT release.
+After a remap, old held keys must be released before the new valid Dismiss can
+work. The pinned application can briefly enter its stopping/transcription path
+in that exceptional case; insertion remains blocked. If a safe current Dismiss
+cannot be established, cleanup releases keys and requests cancellation in the
+app UI instead of pressing an obsolete or guessed shortcut. Cancellation is not
+confirmed in that case.
+
+Cleanup is idempotent. A failed portal does not reconnect or regain insertion
+permission within the process; fix the cause and explicitly restart Wispr.
+IPC readiness remains responsive. A missing portal release cannot be discovered
+immediately without raw monitoring: a five-minute continuous held-action limit
+cancels and disables capture. This limit applies to a continuously held trigger,
+not ordinary released-key hands-free recording. Already delivered OS input or
+paste cannot be retracted.
+
+Default Wayland capture **and text insertion** do not open `/dev/input/event*`.
+The legacy modifier scanner is reachable only with explicit `evdev` capture.
+Packaging grants no physical input access by default and requires no root app,
+privileged daemon, or broad `input` group membership. Injection still uses
+`/dev/uinput`: every process with the same access can synthesize input. This is
+not an application-exclusive permission or complete isolation boundary.
+
+Uinput tracks its synthetic down keys. An uncertain key or synchronization write
+attempts all outstanding releases, destroys and closes the virtual device, and
+prevents reuse. Insertion checks the portal gate before dispatch and before each
+new key-down; releases remain permitted. Physical modifiers held by the user
+cannot be inspected or neutralized in default portal mode. Release unrelated
+physical modifiers when testing paste.
+
+## Build and automated verification
+
+Use a Rust toolchain that supports the committed lockfile:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # if needed
-cargo build            # debug
-cargo build --release  # single stripped binary -> target/release/wispr-flow-linux-helper
-cargo test             # framing roundtrip + decoder tests (proto.rs)
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo build --locked --release
 ```
 
-`x11rb` is pure-Rust (speaks the X11 wire protocol over the socket), so no
-`libxcb`/`libX11` dev headers are required. For the clipboard baseline, install
-`xclip` (or `xsel`). XTEST must be enabled on the X server (it is by default).
+`x11rb` speaks X11 directly and requires no libX11 development headers. Desktop
+runtime requirements include the compositor/portal, writable `/dev/uinput`,
+and clipboard tools as documented in the packaging guide. Building a helper
+changes no device permissions and does not install it into Wispr.
 
-## Test without the full app
-
-`test_harness.py` mimics Electron's spawn (4 stdio pipes: commands on stdin,
-events on **fd 3**) and runs a scripted conversation:
+Real transport tests use a private `dbus-daemon` with a mock portal, the compiled
+helper, actual framing, and temporary Wispr settings:
 
 ```bash
-cargo build
-python3 test_harness.py            # uses ./target/debug/wispr-flow-linux-helper
-RUST_LOG=debug python3 test_harness.py ./target/release/wispr-flow-linux-helper
+cargo build --locked
+python3 -m venv .venv
+.venv/bin/pip install -r tests/requirements-portal.txt
+.venv/bin/python tests/test_portal_integration.py
+# To test the release binary:
+WISPR_TEST_HELPER="$PWD/target/release/wispr-flow-linux-helper" \
+  .venv/bin/python tests/test_portal_integration.py
 ```
 
-Expected: an `ACK` for `IsReady`, an `ActiveAppInfo` for the focused window, a
-`RunningApps` list, and an `AccessibilityStatus`. (PasteText/SimulateKeyPress are
-commented out in the harness because they inject into the focused window.)
+If the environment forbids Unix sockets, set `WISPR_TEST_BUS_TRANSPORT=tcp`
+explicitly to use loopback-only anonymous test authentication. That fallback
+does not verify Unix peer credentials or FD passing. The suite records missing
+ptrace or child `/proc` access as skips; they are not passing syscall audits.
+The libc open interposer includes an explicit evdev positive control.
 
-**Live injection test** (`live_inject_test.py`) exercises the real PasteText +
-chord path against a focused editor:
+The packaging repository separately exercises source-independent fixtures and
+the actual pinned Wispr 1.6.1074 keyboard/state code without committing that
+code. Packaging verifies immutable source, patch, lockfile, complete source
+tree, and built binary SHA-256. A helper's version string is not provenance.
 
-```bash
-# launches its own kate:
-python3 live_inject_test.py target/release/wispr-flow-linux-helper
-# or inject into whatever you already have focused (keep it focused ~5s):
-python3 live_inject_test.py target/release/wispr-flow-linux-helper none
-```
+## Desktop acceptance still required
 
-It PasteTexts a marker, overwrites the clipboard with a sentinel, then Ctrl+A/Ctrl+C
-to read the editor back. The automated readback has a clipboard-owner race that can
-report a false negative — the paste landing is verifiable by eye in the editor.
-
-## Wiring into the app (Phase 0 packaging)
-
-One mandatory patch to the unmodified Electron main bundle: the helper-path
-resolver is a two-way `isMac ? mac : windows` switch with **no Linux case**
-(ipc-contract.md §8). Add a `'linux'` branch pointing at this binary, staged
-under `resources/Release/` (or wherever the Linux build places it), and spawn it
-with `stdio:["pipe","pipe","pipe","pipe"]` (the app already does this).
-
-## Layout
-
-```
-src/
-  main.rs            entry: stdin reader, fd3 writer, dispatch, IsReady/ACK
-  proto.rs           envelope + framing (escape '+'/'|', delimiter '|') + tests
-  keymap.rs          Windows VK -> X11 keysym AND -> Linux evdev KEY_* (from keycodes.json)
-  backend/
-    mod.rs           Backend trait + types + detect() (Wayland > X11 > stub)
-    x11.rs           X11 implementation (XTEST + _NET_* + xclip/xsel)
-    wayland.rs       Wayland implementation (uinput injection + clipboard + KWin)
-    uinput.rs        in-process /dev/uinput virtual keyboard + held-modifier snapshot
-    wl_clipboard.rs  in-process text/plain+text/html clipboard (ext_data_control)
-    kwin.rs          KDE active-window bridge + focus-event source (zbus + KWin script)
-    stub.rs          no-op fallback (keeps handshake alive on unsupported sessions)
-test_harness.py      Electron stand-in: scripted handshake/info conversation
-live_inject_test.py  live PasteText + Ctrl+A/Ctrl+C round-trip against a focused editor
-focus_test.py        focus-event (AppInfoUpdate) streaming + SetFocusChangeDetectorState gating
-clipboard_test.py    in-process clipboard offers text/plain + text/html
-```
-
-## Roadmap (next, in priority order)
-
-1. ✅ **KDE active-app identity + focus events** — done (`backend/kwin.rs`): KWin
-   script pushes `windowActivated` → zbus service → cache + `AppInfoUpdate` events
-   on fd 3 (gated by `SetFocusChangeDetectorState`).
-2. ✅ **Held-modifier snapshot/restore** (Wayland) — done (`backend/uinput.rs`),
-   guarded on `/dev/input` read access. TODO: X11 `XQueryKeymap` equivalent.
-3. ✅ **text/plain + text/html clipboard** (Wayland) — done (`backend/wl_clipboard.rs`,
-   `ext_data_control`). TODO: X11 in-process selection owner; prior-clipboard
-   save/restore (read side still uses `wl-paste`).
-4. **Full `GetRunningApps` on KDE** — walk `workspace.windowList` in the KWin script.
-   **GNOME path** — shell-extension equivalent of the KWin bridge.
-5. **AT-SPI selection** — replace the copy-probe with real `atspi` Text-interface
-   reads (`GetSelectedTextViaCopy` without synthetic Ctrl+C). Both backends.
-6. **Focus tracking on X11** — `PropertyNotify` on `_NET_ACTIVE_WINDOW` → `AppInfoUpdate`.
-7. **codingCliAgent detection** — terminal + running-process heuristics for the
-   `ActiveAppInfo.codingCliAgent` enum.
+On the target CachyOS KDE/Wayland desktop, verify fresh consent and editable
+bindings, background PTT and microphone transcription, native Wayland and
+XWayland insertion, cancellation both while recording and while processing,
+logical and KDE physical shortcut changes, identity and persistence after
+restart, portal denial/closure/restart, and lock/suspend behavior. Audit physical
+device access through idle, recording, and paste; check for stuck modifiers and
+unintended insertion. Run the candidate separately before replacing an installed
+application.
 
 ## Legal
 
-Clean-room reimplementation against a recovered IPC contract; ships no Wispr Flow
-proprietary code, and is released into the public domain under the
-[Unlicense](UNLICENSE). The app itself remains under its own terms — see the
-[legal posture](https://github.com/wispr-flow-linux/wispr-flow-linux#legal-posture)
-in the main repo.
+Clean-room implementation of the recovered helper contract, under the
+[Unlicense](UNLICENSE). Wispr Flow itself remains subject to its own terms.

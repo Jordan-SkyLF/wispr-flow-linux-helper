@@ -188,18 +188,17 @@ impl X11Backend {
                 mod_kcs.push(*kc);
             }
         }
-        // TODO: snapshot & release physically-held modifiers first (XQueryKeymap),
-        // restore after — mirrors the Windows helper's GetKeyState dance.
-        for kc in &mod_kcs {
-            self.fake_key(*kc, true)?;
-        }
-        self.fake_key(key_kc, true)?;
-        self.fake_key(key_kc, false)?;
-        for kc in mod_kcs.iter().rev() {
-            self.fake_key(*kc, false)?;
-        }
-        self.conn.sync().map_err(|e| format!("sync: {e}"))?;
-        Ok(())
+        // This backend can also serve XWayland when uinput is unavailable.
+        // Recheck after clipboard setup and before each press; a portal fault
+        // must not leave Ctrl down or let a delayed Ctrl+V escape its gate.
+        let result = guarded_chord(
+            key_kc,
+            &mod_kcs,
+            crate::capture::injection_allowed,
+            |kc, down| self.fake_key(kc, down),
+        );
+        let sync = self.conn.sync().map_err(|e| format!("sync: {e}"));
+        result.and(sync)
     }
 
     fn clipboard_set(&self, text: &str) -> Result<()> {
@@ -223,6 +222,40 @@ impl X11Backend {
             Err("no clipboard tool (xclip/xsel) available".into())
         }
     }
+}
+
+fn guarded_chord(
+    key: u8,
+    modifiers: &[u8],
+    allowed: impl Fn() -> bool,
+    mut emit: impl FnMut(u8, bool) -> Result<()>,
+) -> Result<()> {
+    let mut pressed = Vec::new();
+    let mut result = Ok(());
+    for &kc in modifiers.iter().chain(std::iter::once(&key)) {
+        if pressed.contains(&kc) {
+            continue;
+        }
+        if !allowed() {
+            result = Err("portal capture has disabled key injection; restart Wispr Flow".into());
+            break;
+        }
+        // A failed flush can leave the server's state uncertain. Include the
+        // attempted press in cleanup and try every release even if one fails.
+        pressed.push(kc);
+        if let Err(error) = emit(kc, true) {
+            result = Err(error);
+            break;
+        }
+    }
+    for kc in pressed.into_iter().rev() {
+        if let Err(error) = emit(kc, false) {
+            if result.is_ok() {
+                result = Err(error);
+            }
+        }
+    }
+    result
 }
 
 impl Backend for X11Backend {
@@ -411,4 +444,61 @@ fn run_capture(prog: &str, args: &[&str]) -> Result<String> {
         .output()
         .map_err(|e| format!("spawn {prog}: {e}"))?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn normal_x11_chord_order_is_preserved() {
+        let mut events = Vec::new();
+        guarded_chord(
+            55,
+            &[37, 50],
+            || true,
+            |kc, down| {
+                events.push((kc, down));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            [
+                (37, true),
+                (50, true),
+                (55, true),
+                (55, false),
+                (50, false),
+                (37, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn portal_fault_prevents_paste_and_releases_already_pressed_modifiers() {
+        let permitted = Cell::new(true);
+        let mut events = Vec::new();
+        assert!(guarded_chord(
+            55,
+            &[37],
+            || permitted.get(),
+            |kc, down| {
+                events.push((kc, down));
+                permitted.set(false);
+                Ok(())
+            }
+        )
+        .is_err());
+        assert_eq!(events, [(37, true), (37, false)]);
+        assert!(guarded_chord(
+            55,
+            &[37],
+            || false,
+            |_, _| { panic!("a closed gate must emit no keys") }
+        )
+        .is_err());
+    }
 }

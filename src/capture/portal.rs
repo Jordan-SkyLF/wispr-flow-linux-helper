@@ -1,430 +1,748 @@
-//! GlobalShortcuts portal capture — the compositor-mediated, device-free path.
-//!
-//! Instead of reading `/dev/input` (a keylogging surface — see [`super::evdev`]),
-//! register the push-to-talk chord with `org.freedesktop.portal.GlobalShortcuts`
-//! and let the compositor own the grab. We never see other keystrokes; we only
-//! get `Activated` / `Deactivated` signals for *our* shortcut. That's the whole
-//! security win, and it's why this is the default on Wayland.
-//!
-//! ## How it maps onto the app's model
-//!
-//! The app has no hotkey detection of its own — it matches the
-//! [`KeypressEvent`](super) stream against `prefs.user.shortcuts`. So when our
-//! shortcut fires we **synthesize that stream**: on `Activated` emit a press for
-//! every VK in the chord, on `Deactivated` emit the releases. We bind the
-//! trigger derived from the *same* chord we synthesize, so what the compositor
-//! grabs and what the app matches stay identical.
-//!
-//! ## Compositor coverage
-//!
-//! The interface is portable (KDE/KWin, GNOME/Mutter, Hyprland). wlroots
-//! (`xdg-desktop-portal-wlr`, e.g. sway) does **not** implement it — there
-//! `start` returns an error and the caller surfaces it (no silent fallback;
-//! `WISPR_CAPTURE=evdev` is the opt-in). KDE additionally requires a real app
-//! identity (systemd app scope) and rejects modifier-only triggers; both are
-//! handled here (the latter as a clear error) and documented in `--doctor`.
-//!
-//! ## Threading / runtime
-//!
-//! Like [`crate::backend::kwin`], zbus's `tokio` feature is enabled tree-wide, so
-//! signals are only dispatched while a runtime drives the connection. We run the
-//! session + signal loop on a dedicated current-thread tokio runtime that lives
-//! for the process; `start` blocks on a readiness channel so its return value
-//! reflects whether binding actually succeeded.
+//! Async GlobalShortcuts transport on a dedicated Tokio runtime (upstream D-008).
+//! One ordered message stream preserves press/release ordering. The portal owns
+//! physical bindings; Wispr's config owns the logical IPC chords we synthesize.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use futures_util::StreamExt;
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
-use zbus::Proxy;
-
-use super::{config, emit_keypress, HeldKeys};
+use super::config::{self, LogicalShortcuts};
+use super::portal_state::{ShortcutState, CANCEL, PTT};
+use super::{emit_keypress, HeldKeys};
 use crate::backend::EventSink;
-use crate::keymap;
+use futures_util::{pin_mut, StreamExt};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use zbus::message::{Message, Type};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+use zbus::{Connection, MessageStream, Proxy};
 
-const PORTAL_DEST: &str = "org.freedesktop.portal.Desktop";
+const SERVICE: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const GS_IFACE: &str = "org.freedesktop.portal.GlobalShortcuts";
 const REQUEST_IFACE: &str = "org.freedesktop.portal.Request";
 const SESSION_IFACE: &str = "org.freedesktop.portal.Session";
-
-/// Our shortcut id within the session. The compositor echoes it back in
-/// `Activated` / `Deactivated`, so we match on it.
-const SHORTCUT_ID: &str = "ptt";
-
-/// How often to re-stat the app config so a chord change (e.g. via the in-app
-/// recorder) triggers a re-bind without restarting the helper.
+const DBUS: &str = "org.freedesktop.DBus";
+const APP_ID: &str = "ai.wisprflow.Flow";
 const CONFIG_POLL: Duration = Duration::from_secs(3);
+const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+const CONSENT_TIMEOUT: Duration = Duration::from_secs(120);
+type Results = HashMap<String, OwnedValue>;
+type BoundShortcuts = Vec<(String, Results)>;
 
-/// Start GlobalShortcuts capture. Returns a [`HeldKeys`] handle immediately and
-/// does the connect/bind on the runtime thread, logging the outcome.
-///
-/// Returns `Err` only for the few failures knowable synchronously (thread spawn,
-/// no config dir, an unbindable chord) so the caller can word its "capture is
-/// off" message precisely. Bind failures that depend on the compositor (portal
-/// absent, denied, slow approval) are logged from the thread — we don't block
-/// startup on a `BindShortcuts` dialog that GNOME always shows and the user may
-/// take a while to approve. There is no fallback to evdev either way.
-pub fn start(events: EventSink) -> Result<Box<dyn HeldKeys>, String> {
-    let cfg_path = config::config_path()
-        .ok_or("no config dir (HOME/XDG_CONFIG_HOME unset)")?;
-    // Fail fast on an unbindable chord (modifier-only): there's nothing the
-    // runtime can do about it and the caller's message should say so.
-    let chord = resolve_chord(&cfg_path)?;
-
-    let held: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
-    let index = Arc::new(AtomicU64::new(0));
-    let pid = std::process::id();
-
-    let thread_held = held.clone();
-    std::thread::Builder::new()
-        .name("key-capture-portal".to_string())
-        .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    log::error!("key capture: portal tokio runtime failed: {e}");
-                    return;
-                }
-            };
-            rt.block_on(run_portal(events, thread_held, index, pid, cfg_path, chord));
-        })
-        .map_err(|e| format!("spawn portal thread: {e}"))?;
-
-    Ok(Box::new(PortalHeld { held }))
+struct PortalStream {
+    messages: MessageStream,
+    // Binding changes can precede BindShortcuts' method reply or Response.
+    // Keep their wire order and apply them before allowing the first action.
+    changes: Vec<Message>,
+}
+impl PortalStream {
+    fn remember_change(&mut self, msg: Message, owner: &str) -> Result<(), String> {
+        if is_signal(&msg, owner, PORTAL_PATH, GS_IFACE)
+            && msg.header().member().map(|m| m.as_str()) == Some("ShortcutsChanged")
+        {
+            if self.changes.len() >= 128 {
+                return Err("portal binding-change queue overflow".into());
+            }
+            self.changes.push(msg);
+        }
+        Ok(())
+    }
 }
 
-/// Runtime-thread body: connect, bind the chord, then loop on the signal streams
-/// (and a config-mtime poll for re-binds) for the process lifetime.
-async fn run_portal(
+#[derive(Default)]
+struct Shared {
+    state: Mutex<ShortcutState>,
+    index: AtomicU64,
+    dirty: AtomicBool,
+    shutdown: AtomicBool,
+}
+struct PortalHeld {
+    shared: Arc<Shared>,
     events: EventSink,
-    held: Arc<Mutex<HashSet<u32>>>,
-    index: Arc<AtomicU64>,
-    pid: u32,
-    cfg_path: std::path::PathBuf,
-    mut chord: Vec<u32>,
-) {
-    let conn = match zbus::Connection::session().await {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("key capture: portal session bus failed: {e}");
-            return;
+    config_path: PathBuf,
+}
+impl Shared {
+    fn emit(&self, events: &EventSink, changes: Vec<(u32, bool)>) {
+        for (vk, down) in changes {
+            emit_keypress(events, &self.index, std::process::id(), vk, down);
         }
-    };
-    let unique = match conn.unique_name() {
-        Some(n) => n.as_str().to_string(),
-        None => {
-            log::error!("key capture: portal session bus has no unique name");
-            return;
-        }
-    };
-    let gs = match Proxy::new(&conn, PORTAL_DEST, PORTAL_PATH, GS_IFACE).await {
-        Ok(p) => p,
-        Err(e) => {
-            log::error!("key capture: GlobalShortcuts proxy failed: {e}");
-            return;
-        }
-    };
-    let mut cfg_mtime = config::config_mtime(&cfg_path);
+    }
+    fn fault(&self, events: &EventSink, replacement: Option<&[u32]>) {
+        super::block_injection();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let changes = state.fault(replacement);
+        // Keep state + enqueue order under one lock so a stale-key response
+        // cannot overtake the cancellation sequence on the shared fd-3 writer.
+        self.emit(events, changes);
+    }
+}
+impl HeldKeys for PortalHeld {
+    fn held_vks(&self) -> HashSet<u32> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .held()
+    }
+    fn dictation_started(&self) {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .work_possible = true;
+    }
+    fn paste_completed(&self) {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .paste_completed();
+    }
+    fn shortcuts_changed(&self) {
+        self.shared.dirty.store(true, Ordering::Release);
+    }
+    fn shutdown(&self) {
+        self.shared.shutdown.store(true, Ordering::Release);
+        terminal_fault(&self.events, &self.shared, &self.config_path);
+    }
+}
 
-    // Subscribe to the per-shortcut signals before binding.
-    let mut activated = match gs.receive_signal("Activated").await {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("key capture: subscribe Activated failed: {e}");
-            return;
+pub fn start(events: EventSink) -> Result<Box<dyn HeldKeys>, String> {
+    let cfg_path = config::config_path().ok_or("HOME/XDG_CONFIG_HOME is missing")?;
+    let app_id = std::env::var("WISPR_PORTAL_APP_ID").unwrap_or_else(|_| APP_ID.into());
+    if !valid_app_id(&app_id) {
+        return Err("WISPR_PORTAL_APP_ID needs a reverse-DNS desktop basename, e.g. ai.wisprflow.Flow (without .desktop)".into());
+    }
+    let shared = Arc::new(Shared::default());
+    let worker = shared.clone();
+    let output = events.clone();
+    let config_path = cfg_path.clone();
+    std::thread::Builder::new().name("key-capture-portal".into()).spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread().enable_all().build()
+            .map_err(|e| format!("portal runtime: {e}"))
+            .and_then(|rt| rt.block_on(run(&output, &worker, &cfg_path, &app_id)));
+        terminal_fault(&output, &worker, &cfg_path);
+        if let Err(error) = result {
+            log::error!("GlobalShortcuts stopped: {error}. Capture and insertion are disabled until Wispr Flow restarts. No raw-input fallback.");
         }
-    };
-    let mut deactivated = match gs.receive_signal("Deactivated").await {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("key capture: subscribe Deactivated failed: {e}");
-            return;
-        }
-    };
+    }).map_err(|e| format!("start portal worker: {e}"))?;
+    Ok(Box::new(PortalHeld {
+        shared,
+        events,
+        config_path,
+    }))
+}
 
-    // Create the session and bind. Failure here is the portal-absent case
-    // (wlroots) or a denied chord; capture stays off until WISPR_CAPTURE=evdev.
-    let mut session = match create_and_bind(&conn, &gs, &unique, &chord).await {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!(
-                "key capture: GlobalShortcuts bind failed ({e}). Push-to-talk and \
-                 the shortcut recorder are OFF. On a compositor without portal \
-                 support (sway/wlroots), set WISPR_CAPTURE=evdev."
-            );
-            return;
-        }
-    };
-    log::info!("key capture: GlobalShortcuts portal active (chord {chord:?} bound)");
+fn valid_app_id(id: &str) -> bool {
+    id.len() <= 255
+        && !id.ends_with(".desktop")
+        && id.split('.').count() >= 3
+        && id.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })
+}
 
-    let mut poll = tokio::time::interval(CONFIG_POLL);
+async fn wait_for_config(path: &Path, shared: &Shared) -> Result<LogicalShortcuts, String> {
+    let mut previous = String::new();
     loop {
-        tokio::select! {
-            Some(msg) = activated.next() => {
-                log::debug!("portal: Activated signal received");
-                if signal_matches(&msg, &session) {
-                    set_chord(&events, &index, pid, &held, &chord, true);
-                }
-            }
-            Some(msg) = deactivated.next() => {
-                log::debug!("portal: Deactivated signal received");
-                if signal_matches(&msg, &session) {
-                    set_chord(&events, &index, pid, &held, &chord, false);
-                }
-            }
-            _ = poll.tick() => {
-                let now = config::config_mtime(&cfg_path);
-                if now != cfg_mtime {
-                    cfg_mtime = now;
-                    if let Some(new) = rebind_on_change(&conn, &gs, &unique, &cfg_path, &chord, &session).await {
-                        chord = new.0;
-                        session = new.1;
-                    }
+        if shared.shutdown.load(Ordering::Acquire) {
+            return Err("helper shutting down".into());
+        }
+        match config::read_shortcuts(path) {
+            Ok(logical) => return Ok(logical),
+            Err(error) => {
+                if error != previous {
+                    log::warn!("portal waiting for Wispr shortcut configuration: {error}. Finish first-run setup or reset incompatible shortcuts in Wispr; capture and insertion remain off.");
+                    previous = error;
                 }
             }
         }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
-/// Read the PTT chord from config and confirm it's bindable as a portal trigger.
-fn resolve_chord(cfg_path: &std::path::Path) -> Result<Vec<u32>, String> {
-    let chord = config::read_ptt_chord(cfg_path).ok_or_else(|| {
-        "no push-to-talk shortcut found in the app config; set one in Wispr Flow first".to_string()
-    })?;
-    if keymap::chord_to_xdg_trigger(&chord).is_none() {
-        return Err(format!(
-            "push-to-talk chord {chord:?} can't be a portal trigger (modifier-only \
-             chords are rejected by KDE). Set a chord that includes a regular key, \
-             or use WISPR_CAPTURE=evdev."
-        ));
-    }
-    Ok(chord)
-}
-
-/// CreateSession + BindShortcuts. Returns the bound session's object path.
-async fn create_and_bind(
-    conn: &zbus::Connection,
-    gs: &Proxy<'_>,
-    unique: &str,
-    chord: &[u32],
-) -> Result<OwnedObjectPath, String> {
-    let trigger = keymap::chord_to_xdg_trigger(chord)
-        .ok_or("internal: chord not bindable (should have been caught earlier)")?;
-
-    // --- CreateSession ---
-    let create_token = "wf_create";
-    let session_token = "wf_session";
-    let mut create_opts: HashMap<&str, Value> = HashMap::new();
-    create_opts.insert("handle_token", Value::from(create_token));
-    create_opts.insert("session_handle_token", Value::from(session_token));
-    let results = portal_call(conn, gs, unique, create_token, "CreateSession", &(create_opts,))
+async fn run(events: &EventSink, shared: &Shared, path: &Path, app_id: &str) -> Result<(), String> {
+    let logical = wait_for_config(path, shared).await?;
+    shared
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .logical = Some(logical.clone());
+    let conn = tokio::time::timeout(CALL_TIMEOUT, Connection::session())
         .await
-        .map_err(|e| format!("CreateSession ({e}) — GlobalShortcuts portal may be unavailable"))?;
-    let session_handle = results
-        .get("session_handle")
-        .and_then(owned_to_string)
-        .ok_or("CreateSession: no session_handle in results")?;
-    let session_path = ObjectPath::try_from(session_handle)
-        .map_err(|e| format!("session_handle not an object path: {e}"))?;
-
-    // --- BindShortcuts ---
-    let bind_token = "wf_bind";
-    let mut shortcut_meta: HashMap<&str, Value> = HashMap::new();
-    shortcut_meta.insert("description", Value::from("Wispr Flow push-to-talk"));
-    shortcut_meta.insert("preferred_trigger", Value::from(trigger.as_str()));
-    let shortcuts: Vec<(&str, HashMap<&str, Value>)> = vec![(SHORTCUT_ID, shortcut_meta)];
-    let mut bind_opts: HashMap<&str, Value> = HashMap::new();
-    bind_opts.insert("handle_token", Value::from(bind_token));
-    let _ = portal_call(
-        conn,
-        gs,
-        unique,
-        bind_token,
-        "BindShortcuts",
-        &(&session_path, shortcuts, "", bind_opts),
+        .map_err(|_| "session bus connection timed out")?
+        .map_err(|e| format!("session bus: {e}"))?;
+    let bus = Proxy::new(&conn, DBUS, "/org/freedesktop/DBus", DBUS)
+        .await
+        .map_err(|e| e.to_string())?;
+    let owner: String = match timed(bus.call("GetNameOwner", &(SERVICE,))).await {
+        Ok(owner) => owner,
+        Err(zbus::Error::MethodError(name, _, _))
+            if name.as_str() == "org.freedesktop.DBus.Error.NameHasNoOwner" =>
+        {
+            let _: u32 = timed(bus.call("StartServiceByName", &(SERVICE, 0u32)))
+                .await
+                .map_err(|e| e.to_string())?;
+            timed(bus.call("GetNameOwner", &(SERVICE,)))
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        Err(error) => return Err(format!("portal service owner: {error}")),
+    };
+    zbus::names::UniqueName::try_from(owner.as_str()).map_err(|e| e.to_string())?;
+    // Queue before subscriptions/calls. AddMatch limits delivered broadcasts;
+    // local header checks remain mandatory, including for unicast signals.
+    let mut messages = MessageStream::from(&conn);
+    messages.set_max_queued(128);
+    let mut stream = PortalStream {
+        messages,
+        changes: Vec::new(),
+    };
+    let _: () = timed(bus.call(
+        "AddMatch",
+        &(format!(
+            "type='signal',sender='{owner}',path_namespace='{PORTAL_PATH}'"
+        ),),
+    ))
+    .await
+    .map_err(|e| e.to_string())?;
+    let _: () = timed(bus.call("AddMatch",&(format!("type='signal',sender='{DBUS}',interface='{DBUS}',member='NameOwnerChanged',arg0='{SERVICE}'"),))).await.map_err(|e| e.to_string())?;
+    let current: String = timed(bus.call("GetNameOwner", &(SERVICE,)))
+        .await
+        .map_err(|e| e.to_string())?;
+    if current != owner {
+        return Err("portal owner changed during setup".into());
+    }
+    let registry = Proxy::new(
+        &conn,
+        owner.as_str(),
+        PORTAL_PATH,
+        "org.freedesktop.host.portal.Registry",
     )
     .await
-    .map_err(|e| format!("BindShortcuts: {e}"))?;
-
-    Ok(session_path.into())
+    .map_err(|e| e.to_string())?;
+    let options: HashMap<&str, Value> = HashMap::new();
+    match timed(registry.call::<_, _, ()>("Register", &(app_id, options))).await {
+        Ok(()) => {}
+        Err(zbus::Error::MethodError(name, _, _))
+            if matches!(
+                name.as_str(),
+                "org.freedesktop.DBus.Error.UnknownMethod"
+                    | "org.freedesktop.DBus.Error.UnknownInterface"
+            ) =>
+        {
+            log::warn!("Host Registry unavailable; desktop-derived identity must resolve to {app_id}. Launch its installed desktop entry; consent/persistence remain unverified.");
+        }
+        Err(error) => {
+            return Err(format!(
+                "Host Registry: {error}; ensure {app_id}.desktop is installed and discoverable"
+            ))
+        }
+    }
+    let gs = Proxy::new(&conn, owner.as_str(), PORTAL_PATH, GS_IFACE)
+        .await
+        .map_err(|e| e.to_string())?;
+    let version: u32 = timed(gs.get_property("version"))
+        .await
+        .map_err(|e| e.to_string())?;
+    if version < 1 {
+        return Err("GlobalShortcuts version 1 or later is required".into());
+    }
+    // Pin identity AND calls to this owner; drain its queued owner-loss event
+    // inside portal_call so a restart during Register cannot silently succeed.
+    let options = HashMap::from([
+        ("handle_token", Value::from("wf_create")),
+        ("session_handle_token", Value::from("wf_session")),
+    ]);
+    let mut created =
+        portal_call(&mut stream, &gs, &owner, "CreateSession", &(options,), None).await?;
+    // The spec intentionally uses a string variant, not an object-path variant.
+    let session = String::try_from(
+        created
+            .remove("session_handle")
+            .ok_or("CreateSession omitted session_handle")?,
+    )
+    .map_err(|e| format!("invalid session handle: {e}"))?;
+    if !session.starts_with(&format!("{PORTAL_PATH}/session/")) {
+        return Err("session handle outside portal namespace".into());
+    }
+    let session = OwnedObjectPath::try_from(session).map_err(|e| e.to_string())?;
+    let result = run_session(
+        events,
+        shared,
+        path,
+        &logical,
+        &mut stream,
+        &gs,
+        &owner,
+        &session,
+    )
+    .await;
+    terminal_fault(events, shared, path);
+    if let Ok(proxy) = Proxy::new(&conn, owner.as_str(), session.as_str(), SESSION_IFACE).await {
+        let _ = tokio::time::timeout(Duration::from_secs(2), proxy.call::<_, _, ()>("Close", &()))
+            .await;
+    }
+    result
 }
 
-/// Invoke a portal method that follows the Request/Response pattern: subscribe to
-/// the request's `Response` signal (path derived from our unique name + the
-/// handle token), make the call, await the response, return its results dict.
-async fn portal_call<B>(
-    conn: &zbus::Connection,
+async fn timed<T>(future: impl std::future::Future<Output = zbus::Result<T>>) -> zbus::Result<T> {
+    tokio::time::timeout(CALL_TIMEOUT, future)
+        .await
+        .map_err(|_| zbus::Error::Failure("D-Bus method timed out".into()))?
+}
+
+fn suggested_triggers(logical: &LogicalShortcuts) -> (String, String) {
+    // Reuse an existing bare function-key choice at first registration. Other
+    // chords get safe editable suggestions; physical modifiers cannot be
+    // inspected without violating the portal privacy boundary.
+    let function = |keys: &[u32]| {
+        (keys.len() == 1 && (112..=135).contains(&keys[0]))
+            .then(|| crate::keymap::chord_to_xdg_trigger(keys))
+            .flatten()
+    };
+    let ptt = function(&logical.ptt).unwrap_or_else(|| "F8".into());
+    let mut cancel = function(&logical.cancel).unwrap_or_else(|| "F9".into());
+    if cancel == ptt {
+        cancel = if ptt == "F9" {
+            "F8".into()
+        } else {
+            "F9".into()
+        };
+    }
+    (ptt, cancel)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_session(
+    events: &EventSink,
+    shared: &Shared,
+    config_path: &Path,
+    initial: &LogicalShortcuts,
+    stream: &mut PortalStream,
     gs: &Proxy<'_>,
-    unique: &str,
-    handle_token: &str,
+    owner: &str,
+    session: &OwnedObjectPath,
+) -> Result<(), String> {
+    let (ptt_trigger, cancel_trigger) = suggested_triggers(initial);
+    let shortcuts = vec![
+        (
+            PTT,
+            HashMap::from([
+                ("description", Value::from("Wispr Flow: hold to dictate")),
+                ("preferred_trigger", Value::from(ptt_trigger.as_str())),
+            ]),
+        ),
+        (
+            CANCEL,
+            HashMap::from([
+                ("description", Value::from("Wispr Flow: cancel dictation")),
+                ("preferred_trigger", Value::from(cancel_trigger.as_str())),
+            ]),
+        ),
+    ];
+    let options = HashMap::from([("handle_token", Value::from("wf_bind"))]);
+    // Bind once per new session, including when KDE has persisted shortcuts.
+    let mut response = portal_call(
+        stream,
+        gs,
+        owner,
+        "BindShortcuts",
+        &(session, shortcuts, "", options),
+        Some(session),
+    )
+    .await?;
+    let bound = BoundShortcuts::try_from(
+        response
+            .remove("shortcuts")
+            .ok_or("BindShortcuts omitted shortcuts")?,
+    )
+    .map_err(|e| e.to_string())?;
+    let mut registered = approved_bindings(bound)?;
+    for msg in std::mem::take(&mut stream.changes) {
+        let (changed, bound): (OwnedObjectPath, BoundShortcuts) =
+            msg.body().deserialize().map_err(|e| e.to_string())?;
+        if changed == *session {
+            registered = approved_bindings(bound)?;
+        }
+    }
+    // Consent may take minutes. Do not synthesize a cached chord after the app
+    // changed settings while the dialog was open; pre-approval activations
+    // have deliberately been discarded by portal_call.
+    let latest = match config::read_shortcuts(config_path) {
+        Ok(logical) => logical,
+        Err(error) => {
+            configuration_fault(events, shared, config_path);
+            return Err(format!(
+                "shortcut settings changed while awaiting permission: {error}"
+            ));
+        }
+    };
+    {
+        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.faulted {
+            return Err("capture already stopped during setup".into());
+        }
+        if state.logical.as_ref() != Some(&latest) && state.busy() {
+            super::block_injection();
+            let changes = state.fault(Some(&latest.cancel));
+            shared.emit(events, changes);
+            return Err(
+                "shortcut settings changed during recording while awaiting permission".into(),
+            );
+        }
+        state.logical = Some(latest);
+        state.approved = registered.keys().cloned().collect();
+        if registered.contains_key(PTT) {
+            super::allow_injection();
+        }
+    }
+    report_bindings(&registered);
+    let mut observed = HashSet::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut next_config = Instant::now();
+    loop {
+        tokio::select! {
+            message = stream.messages.next() => {
+                let msg = message.ok_or("session bus disconnected")?.map_err(|e| format!("session bus disconnected: {e}"))?;
+                lifecycle(&msg,owner,Some(session))?;
+                if !is_signal(&msg,owner,PORTAL_PATH,GS_IFACE) { continue; }
+                match msg.header().member().map(|m| m.as_str()) {
+                    Some("ShortcutsChanged") => {
+                        let (changed,bound): (OwnedObjectPath,BoundShortcuts) = msg.body().deserialize().map_err(|e| e.to_string())?;
+                        if changed != *session { continue; }
+                        let new = approved_bindings(bound)?;
+                        if new == registered { continue; }
+                        if shared.state.lock().unwrap_or_else(|e| e.into_inner()).busy() {
+                            return Err("KDE shortcuts changed during possible recording/processing; cancellation required".into());
+                        }
+                        if registered.contains_key(PTT) && !new.contains_key(PTT) {
+                            return Err("KDE revoked or removed the active PTT binding".into());
+                        }
+                        shared.state.lock().unwrap_or_else(|e| e.into_inner()).approved = new.keys().cloned().collect();
+                        registered = new;
+                        observed.clear();
+                        if registered.contains_key(PTT) { super::allow_injection(); }
+                        report_bindings(&registered);
+                    }
+                    Some(member @ ("Activated"|"Deactivated")) => {
+                        let (sig_session,id,_timestamp,_options): (OwnedObjectPath,String,u64,Results) = msg.body().deserialize().map_err(|e| e.to_string())?;
+                        if sig_session != *session || !registered.contains_key(&id) { continue; }
+                        let down = member=="Activated";
+                        if down { synchronize_config(events, shared, config_path)?; }
+                        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                        let changes = state.transition(&id,down,Instant::now());
+                        shared.emit(events,changes);
+                        if down && observed.insert(id.clone()) {
+                            log::info!("portal action {id} activated by compositor; binding event delivery confirmed (recording/insertion still need desktop acceptance)");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ = tick.tick() => {
+                if shared.shutdown.load(Ordering::Acquire) { return Ok(()); }
+                if shared.state.lock().unwrap_or_else(|e| e.into_inner()).expired(Instant::now()) {
+                    return Err("shortcut release missing or hold exceeded five minutes; cancelling rather than completing recording".into());
+                }
+                let dirty = shared.dirty.swap(false,Ordering::AcqRel);
+                if dirty || Instant::now() >= next_config {
+                    next_config = Instant::now()+CONFIG_POLL;
+                    synchronize_config(events, shared, config_path)?;
+                }
+            }
+        }
+    }
+}
+
+fn synchronize_config(events: &EventSink, shared: &Shared, path: &Path) -> Result<(), String> {
+    let new = match config::read_shortcuts(path) {
+        Ok(logical) => logical,
+        Err(error) => {
+            configuration_fault(events, shared, path);
+            return Err(format!(
+                "Wispr shortcut configuration became unavailable or incompatible: {error}"
+            ));
+        }
+    };
+    let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.logical.as_ref() != Some(&new) {
+        if state.busy() {
+            super::block_injection();
+            let changes = state.fault(Some(&new.cancel));
+            shared.emit(events, changes);
+            return Err("Wispr shortcuts changed during possible recording/processing; cancelled using the new logical Dismiss; restart required".into());
+        }
+        log::info!("Wispr logical shortcuts synchronized: PTT {:?}, Dismiss {:?}; KDE physical bindings retained", new.ptt, new.cancel);
+        state.logical = Some(new);
+    }
+    Ok(())
+}
+
+fn terminal_fault(events: &EventSink, shared: &Shared, path: &Path) {
+    super::block_injection();
+    let current = {
+        let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.faulted {
+            return;
+        }
+        state.logical.clone()
+    };
+    match config::read_shortcuts(path) {
+        Ok(latest) if current.as_ref() == Some(&latest) => shared.fault(events, None),
+        Ok(latest) => shared.fault(events, Some(&latest.cancel)),
+        Err(_) => configuration_fault(events, shared, path),
+    }
+}
+
+fn configuration_fault(events: &EventSink, shared: &Shared, path: &Path) {
+    match config::read_cancel(path) {
+        Ok(cancel) => shared.fault(events, Some(&cancel)),
+        Err(error) => {
+            // Do not press the old cancellation mapping: the app may now bind
+            // it to a different action. Insertion remains blocked. Empty new
+            // cancel means release-only cleanup, never a guessed keypress.
+            shared.fault(events, Some(&[]));
+            log::error!("Current logical cancellation cannot be established ({error}); cancel any recording in the Wispr UI, then correct shortcuts and restart. Recording cancellation is NOT confirmed.");
+        }
+    }
+}
+
+fn report_bindings(bound: &HashMap<String, String>) {
+    if let Some(trigger) = bound.get(PTT) {
+        log::info!("GlobalShortcuts registered PTT {trigger:?}; awaiting a real compositor activation, not yet proof of a working shortcut");
+    } else {
+        log::warn!("PTT has no active trigger. Assign a shortcut to Wispr Flow in KDE System Settings > Keyboard > Shortcuts; capture/insertion remain off.");
+    }
+    if !bound.contains_key(CANCEL) {
+        log::warn!("Cancel has no active KDE trigger. Assign a cancel shortcut in KDE; configured logical Dismiss is retained for fault cleanup.");
+    }
+}
+
+fn approved_bindings(bound: BoundShortcuts) -> Result<HashMap<String, String>, String> {
+    let mut result = HashMap::new();
+    let mut seen = HashSet::new();
+    for (id, properties) in bound {
+        if !matches!(id.as_str(), PTT | CANCEL) {
+            continue;
+        }
+        if !seen.insert(id.clone()) {
+            return Err(format!("portal returned duplicate shortcut ID {id}"));
+        }
+        let trigger = properties
+            .get("trigger_description")
+            .and_then(|v| <&str>::try_from(v).ok());
+        if let Some(trigger) = trigger
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
+        {
+            result.insert(id, trigger.into());
+        }
+    }
+    Ok(result)
+}
+
+fn is_signal(msg: &Message, owner: &str, path: &str, interface: &str) -> bool {
+    let h = msg.header();
+    h.message_type() == Type::Signal
+        && h.sender().map(|s| s.as_str()) == Some(owner)
+        && h.path().map(|p| p.as_str()) == Some(path)
+        && h.interface().map(|i| i.as_str()) == Some(interface)
+}
+fn lifecycle(msg: &Message, owner: &str, session: Option<&OwnedObjectPath>) -> Result<(), String> {
+    let h = msg.header();
+    if is_signal(msg, DBUS, "/org/freedesktop/DBus", DBUS)
+        && h.member().map(|m| m.as_str()) == Some("NameOwnerChanged")
+    {
+        let (name, old, new): (String, String, String) =
+            msg.body().deserialize().map_err(|e| e.to_string())?;
+        if name == SERVICE && old == owner && new != owner {
+            return Err("portal service owner changed or disconnected".into());
+        }
+    }
+    if session.is_some_and(|s| is_signal(msg, owner, s.as_str(), SESSION_IFACE))
+        && h.member().map(|m| m.as_str()) == Some("Closed")
+    {
+        return Err("shortcut session closed or permission revoked".into());
+    }
+    Ok(())
+}
+fn response_from(
+    msg: &Message,
+    owner: &str,
+    request: &OwnedObjectPath,
+) -> Option<Result<Results, String>> {
+    if !is_signal(msg, owner, request.as_str(), REQUEST_IFACE)
+        || msg.header().member().map(|m| m.as_str()) != Some("Response")
+    {
+        return None;
+    }
+    Some(
+        msg.body()
+            .deserialize::<(u32, Results)>()
+            .map_err(|e| e.to_string())
+            .and_then(|(code, result)| match code {
+                0 => Ok(result),
+                1 => Err("portal permission cancelled by user".into()),
+                _ => Err(format!(
+                    "portal permission denied/request failed (response {code})"
+                )),
+            }),
+    )
+}
+
+async fn portal_call<B>(
+    stream: &mut PortalStream,
+    proxy: &Proxy<'_>,
+    owner: &str,
     method: &str,
     body: &B,
-) -> Result<HashMap<String, OwnedValue>, String>
+    session: Option<&OwnedObjectPath>,
+) -> Result<Results, String>
 where
     B: serde::Serialize + zbus::zvariant::DynamicType,
 {
-    let req_path = request_path(unique, handle_token);
-    let req_proxy = Proxy::new(conn, PORTAL_DEST, req_path.as_str(), REQUEST_IFACE)
-        .await
-        .map_err(|e| format!("request proxy: {e}"))?;
-    let mut responses = req_proxy
-        .receive_signal("Response")
-        .await
-        .map_err(|e| format!("subscribe Response: {e}"))?;
-
-    // The method reply is just the (server-chosen) request handle; we drive off
-    // the Response signal at the path we pre-computed, so ignore the value.
-    gs.call::<_, _, OwnedObjectPath>(method, body)
-        .await
-        .map_err(|e| format!("{method} call: {e}"))?;
-
-    let msg = responses
-        .next()
-        .await
-        .ok_or_else(|| format!("{method}: response stream ended"))?;
-    let (code, results): (u32, HashMap<String, OwnedValue>) = msg
-        .body()
-        .deserialize()
-        .map_err(|e| format!("{method} response decode: {e}"))?;
-    match code {
-        0 => Ok(results),
-        1 => Err(format!("{method} cancelled by user")),
-        other => Err(format!("{method} failed (response code {other})")),
-    }
-}
-
-/// Re-read the config after an mtime change and, if the chord changed and is
-/// still bindable, close the old session and bind the new chord. Returns the new
-/// `(chord, session)` on success, None to keep the current binding.
-async fn rebind_on_change(
-    conn: &zbus::Connection,
-    gs: &Proxy<'_>,
-    unique: &str,
-    cfg_path: &std::path::Path,
-    current: &[u32],
-    old_session: &OwnedObjectPath,
-) -> Option<(Vec<u32>, OwnedObjectPath)> {
-    let new_chord = match resolve_chord(cfg_path) {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("portal re-bind skipped: {e}");
-            return None;
+    // Keep draining while the method reply is pending: responses may arrive
+    // first, including at a server-chosen path different from handle_token.
+    let call = proxy.call_method(method, body);
+    pin_mut!(call);
+    let deadline = tokio::time::sleep(CALL_TIMEOUT);
+    pin_mut!(deadline);
+    let mut early = VecDeque::new();
+    let request: OwnedObjectPath = loop {
+        tokio::select! {
+            reply = &mut call => {
+                let reply=reply.map_err(|e|format!("{method}: {e}"))?;
+                if reply.header().sender().map(|s|s.as_str())!=Some(owner) { return Err("portal method reply has unexpected sender".into()); }
+                break reply.body().deserialize().map_err(|e|e.to_string())?;
+            }
+            msg = stream.messages.next() => {
+                let msg=msg.ok_or("session bus disconnected")?.map_err(|e|e.to_string())?;
+                lifecycle(&msg,owner,session)?;
+                if msg.header().message_type()==Type::Signal {
+                    if early.len() >= 128 { return Err("portal response queue overflow".into()); }
+                    early.push_back(msg);
+                }
+            }
+            _ = &mut deadline => return Err(format!("{method} method reply timed out")),
         }
     };
-    if new_chord == current {
-        return None;
-    }
-    log::info!("portal: PTT chord changed {current:?} -> {new_chord:?}, re-binding");
-    close_session(conn, old_session).await;
-    match create_and_bind(conn, gs, unique, &new_chord).await {
-        Ok(session) => Some((new_chord, session)),
-        Err(e) => {
-            log::warn!("portal re-bind failed: {e}");
-            None
-        }
-    }
-}
-
-/// Close a portal session (best-effort; logged at debug on failure).
-async fn close_session(conn: &zbus::Connection, session: &OwnedObjectPath) {
-    match Proxy::new(conn, PORTAL_DEST, session, SESSION_IFACE).await {
-        Ok(p) => {
-            if let Err(e) = p.call::<_, _, ()>("Close", &()).await {
-                log::debug!("portal session Close: {e}");
-            }
-        }
-        Err(e) => log::debug!("portal session proxy: {e}"),
-    }
-}
-
-/// True if an `Activated`/`Deactivated` signal is for our session + shortcut id.
-fn signal_matches(msg: &zbus::Message, session: &OwnedObjectPath) -> bool {
-    // Body: (o session_handle, s shortcut_id, t timestamp, a{sv} options).
-    match msg
-        .body()
-        .deserialize::<(OwnedObjectPath, String, u64, HashMap<String, OwnedValue>)>()
+    if !request
+        .as_str()
+        .starts_with(&format!("{PORTAL_PATH}/request/"))
     {
-        Ok((sig_session, shortcut_id, _, _)) => {
-            sig_session.as_ref() == session.as_ref() && shortcut_id == SHORTCUT_ID
-        }
-        Err(e) => {
-            log::debug!("portal signal decode: {e}");
-            false
+        return Err("request handle outside portal namespace".into());
+    }
+    let mut response = None;
+    for msg in early {
+        if let Some(result) = response_from(&msg, owner, &request) {
+            if response.is_some() {
+                return Err("duplicate portal request Response".into());
+            }
+            // A successful Response is the authoritative binding snapshot at
+            // this position in the wire stream; earlier provisional changes
+            // must not overwrite it. Later changes remain ordered after it.
+            stream.changes.clear();
+            response = Some(result);
+        } else {
+            stream.remember_change(msg, owner)?;
         }
     }
-}
-
-/// Synthesize the chord as a press or release: emit a `KeypressEvent` per VK and
-/// update the held-keys set (presses in order, releases in reverse).
-fn set_chord(
-    events: &EventSink,
-    index: &AtomicU64,
-    pid: u32,
-    held: &Arc<Mutex<HashSet<u32>>>,
-    chord: &[u32],
-    press: bool,
-) {
-    let order: Vec<u32> = if press {
-        chord.to_vec()
-    } else {
-        chord.iter().rev().copied().collect()
-    };
-    for vk in order {
-        emit_keypress(events, index, pid, vk, press);
-        if let Ok(mut set) = held.lock() {
-            if press {
-                set.insert(vk);
-            } else {
-                set.remove(&vk);
+    if let Some(response) = response {
+        return response;
+    }
+    let deadline = tokio::time::sleep(CONSENT_TIMEOUT);
+    pin_mut!(deadline);
+    loop {
+        tokio::select! {
+            msg = stream.messages.next() => {
+                let msg=msg.ok_or("session bus disconnected")?.map_err(|e|e.to_string())?;
+                lifecycle(&msg,owner,session)?;
+                if let Some(result)=response_from(&msg,owner,&request) {
+                    stream.changes.clear();
+                    return result;
+                }
+                stream.remember_change(msg, owner)?;
+            }
+            _ = &mut deadline => {
+                if let Ok(close)=Proxy::new(proxy.connection(),owner,request.as_str(),REQUEST_IFACE).await {
+                    let _=tokio::time::timeout(Duration::from_secs(2),close.call::<_,_,()>("Close",&())).await;
+                }
+                return Err(format!("{method} permission response timed out; restart to request again"));
             }
         }
-    }
-}
-
-/// The request object path the portal will use for a call with this handle
-/// token: `/org/freedesktop/portal/desktop/request/<SENDER>/<token>`, where
-/// SENDER is our unique name with the leading ':' stripped and '.' -> '_'.
-/// Documented by the portal spec so clients can subscribe before calling.
-fn request_path(unique: &str, token: &str) -> String {
-    let sender = unique.trim_start_matches(':').replace('.', "_");
-    format!("/org/freedesktop/portal/desktop/request/{sender}/{token}")
-}
-
-/// Best-effort extraction of a `String` from an `a{sv}` value.
-fn owned_to_string(v: &OwnedValue) -> Option<String> {
-    <&str>::try_from(&**v).ok().map(str::to_string)
-}
-
-/// Stale-key querier backed by the tracked activation state. Mirrors evdev's
-/// `EVIOCGKEY`: a key the app thinks is held but that isn't in our set has been
-/// released (the portal told us so via `Deactivated`).
-struct PortalHeld {
-    held: Arc<Mutex<HashSet<u32>>>,
-}
-
-impl HeldKeys for PortalHeld {
-    fn held_vks(&self) -> HashSet<u32> {
-        self.held.lock().map(|g| g.clone()).unwrap_or_default()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn request_path_matches_portal_convention() {
-        // Leading ':' stripped, '.' -> '_', token appended.
+    fn registered_but_unbound_and_unknown_ids_are_not_approved() {
+        let value = |s: &str| OwnedValue::try_from(Value::from(s)).unwrap();
+        let bound = vec![
+            (
+                PTT.into(),
+                HashMap::from([("trigger_description".into(), value("none"))]),
+            ),
+            (
+                CANCEL.into(),
+                HashMap::from([("trigger_description".into(), value(" F9 "))]),
+            ),
+            (
+                "other".into(),
+                HashMap::from([("trigger_description".into(), value("F10"))]),
+            ),
+        ];
         assert_eq!(
-            request_path(":1.407", "wf_create"),
-            "/org/freedesktop/portal/desktop/request/1_407/wf_create"
+            approved_bindings(bound).unwrap(),
+            HashMap::from([(CANCEL.into(), "F9".into())])
+        );
+        assert!(approved_bindings(vec![
+            (PTT.into(), HashMap::new()),
+            (PTT.into(), HashMap::new())
+        ])
+        .is_err());
+    }
+    #[test]
+    fn identity_is_stable_and_desktop_basename_only() {
+        assert!(valid_app_id(APP_ID));
+        for invalid in [
+            "wispr-flow",
+            "",
+            "ai..Flow",
+            "ai.wisprflow.Flow.desktop",
+            "ai.wisprflow/Flow",
+        ] {
+            assert!(!valid_app_id(invalid));
+        }
+    }
+    #[test]
+    fn physical_suggestions_do_not_require_bindable_logical_chords() {
+        assert_eq!(
+            suggested_triggers(&LogicalShortcuts {
+                ptt: vec![162, 91],
+                cancel: vec![27]
+            }),
+            ("F8".into(), "F9".into())
+        );
+        assert_eq!(
+            suggested_triggers(&LogicalShortcuts {
+                ptt: vec![120],
+                cancel: vec![27]
+            }),
+            ("F9".into(), "F8".into())
+        );
+        assert_eq!(
+            suggested_triggers(&LogicalShortcuts {
+                ptt: vec![117],
+                cancel: vec![122]
+            }),
+            ("F6".into(), "F11".into())
         );
     }
 }
