@@ -76,6 +76,11 @@ zero/equal/non-monotonic timestamps, early responses, and binding changes.
 An empty or `none` trigger description is not an active binding. Registration,
 the first received activation, and actual dictation are separate observations.
 
+On KDE, the backend service owner is pinned as well as the frontend owner.
+Backend replacement cancels even when the frontend retains its session and
+never sends a release or closure signal. Only authenticated bus owner-change
+signals can trigger this protection.
+
 Denial, owner replacement, disconnection, session closure, active binding loss,
 or a change during possible recording/processing closes the insertion gate
 before cleanup. For unchanged settings, logical Dismiss precedes PTT release.

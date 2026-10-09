@@ -33,6 +33,7 @@ from dbus_next.auth import AuthAnnonymous
 
 
 SERVICE = "org.freedesktop.portal.Desktop"
+KDE_SERVICE = "org.freedesktop.impl.portal.desktop.kde"
 PATH = "/org/freedesktop/portal/desktop"
 GLOBAL = "org.freedesktop.portal.GlobalShortcuts"
 REGISTRY = "org.freedesktop.host.portal.Registry"
@@ -797,6 +798,53 @@ class PortalIntegration(unittest.IsolatedAsyncioTestCase):
         await helper.wait_keys(6)
         self.assert_key_pairs(helper, FAULT_KEYS)
         self.assertEqual(await helper.stale(), [162, 91, 27])
+        await self.assert_injection_blocked(helper)
+
+    async def test_kde_backend_loss_cancels_with_frontend_still_running(self):
+        backend = await connect_bus(self.address)
+        self.extra_buses.append(backend)
+        await backend.request_name(KDE_SERVICE)
+        portal, helper = await self.launch(helper_env={"XDG_CURRENT_DESKTOP": "KDE"})
+        await self.activate(portal, helper)
+        await backend.release_name(KDE_SERVICE)
+        await helper.wait_keys(6)
+        await backend.request_name(KDE_SERVICE)
+        await portal.emit("Deactivated")
+        await portal.emit("Activated")
+        await asyncio.sleep(0.1)
+        self.assert_key_pairs(helper, FAULT_KEYS)
+        self.assertEqual(len(portal.sessions), 1)
+        self.assertIn(b"KDE portal backend owner changed", helper.stderr)
+        await self.assert_injection_blocked(helper)
+
+    async def test_forged_kde_backend_loss_is_ignored(self):
+        backend = await connect_bus(self.address)
+        self.extra_buses.append(backend)
+        await backend.request_name(KDE_SERVICE)
+        portal, helper = await self.launch(helper_env={"XDG_CURRENT_DESKTOP": "KDE"})
+        await self.activate(portal, helper)
+        await backend.send(Message.new_signal(
+            "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameOwnerChanged", "sss",
+            [KDE_SERVICE, backend.unique_name, ""],
+        ))
+        await portal.emit("Deactivated")
+        await helper.wait_keys(4)
+        self.assert_key_pairs(helper, [
+            (162, "key_event_press"), (91, "key_event_press"),
+            (91, "key_event_release"), (162, "key_event_release"),
+        ])
+
+    async def test_kde_backend_loss_during_consent_blocks_capture(self):
+        backend = await connect_bus(self.address)
+        self.extra_buses.append(backend)
+        await backend.request_name(KDE_SERVICE)
+        portal, helper = await self.launch(
+            helper_env={"XDG_CURRENT_DESKTOP": "KDE"}, pause_bind=True,
+        )
+        await portal.wait_calls("BindShortcuts")
+        await backend.release_name(KDE_SERVICE)
+        await helper.wait_for(lambda: b"KDE portal backend owner changed" in helper.stderr)
+        self.assertEqual(helper.keys(), [])
         await self.assert_injection_blocked(helper)
 
     async def test_fault_after_ptt_release_still_cancels_processing_or_handsfree(self):

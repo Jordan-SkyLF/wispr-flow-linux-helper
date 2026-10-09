@@ -17,6 +17,7 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MessageStream, Proxy};
 
 const SERVICE: &str = "org.freedesktop.portal.Desktop";
+const KDE_SERVICE: &str = "org.freedesktop.impl.portal.desktop.kde";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const GS_IFACE: &str = "org.freedesktop.portal.GlobalShortcuts";
 const REQUEST_IFACE: &str = "org.freedesktop.portal.Request";
@@ -31,11 +32,33 @@ type BoundShortcuts = Vec<(String, Results)>;
 
 struct PortalStream {
     messages: MessageStream,
+    kde_owner: Option<String>,
     // Binding changes can precede BindShortcuts' method reply or Response.
     // Keep their wire order and apply them before allowing the first action.
     changes: Vec<Message>,
 }
 impl PortalStream {
+    fn lifecycle(
+        &self,
+        msg: &Message,
+        owner: &str,
+        session: Option<&OwnedObjectPath>,
+    ) -> Result<(), String> {
+        lifecycle(msg, owner, session)?;
+        if let Some(kde_owner) = &self.kde_owner {
+            if is_signal(msg, DBUS, "/org/freedesktop/DBus", DBUS)
+                && msg.header().member().map(|m| m.as_str()) == Some("NameOwnerChanged")
+            {
+                let (name, old, new): (String, String, String) =
+                    msg.body().deserialize().map_err(|e| e.to_string())?;
+                if name == KDE_SERVICE && old == *kde_owner && new != *kde_owner {
+                    return Err("KDE portal backend owner changed or disconnected".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn remember_change(&mut self, msg: Message, owner: &str) -> Result<(), String> {
         if is_signal(&msg, owner, PORTAL_PATH, GS_IFACE)
             && msg.header().member().map(|m| m.as_str()) == Some("ShortcutsChanged")
@@ -199,8 +222,25 @@ async fn run(events: &EventSink, shared: &Shared, path: &Path, app_id: &str) -> 
     messages.set_max_queued(128);
     let mut stream = PortalStream {
         messages,
+        kde_owner: None,
         changes: Vec::new(),
     };
+    // The frontend can outlive KDE's backend without closing its sessions.
+    // Pin that backend too, before creating a shortcut session, so its loss
+    // cannot leave a held logical PTT recording until the five-minute limit.
+    if std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .split(':')
+        .any(|desktop| desktop.eq_ignore_ascii_case("KDE"))
+    {
+        let _: () = timed(bus.call("AddMatch", &(format!("type='signal',sender='{DBUS}',interface='{DBUS}',member='NameOwnerChanged',arg0='{KDE_SERVICE}'"),)))
+            .await.map_err(|e| e.to_string())?;
+        let kde_owner: String = timed(bus.call("GetNameOwner", &(KDE_SERVICE,)))
+            .await
+            .map_err(|e| format!("KDE portal backend owner: {e}"))?;
+        zbus::names::UniqueName::try_from(kde_owner.as_str()).map_err(|e| e.to_string())?;
+        stream.kde_owner = Some(kde_owner);
+    }
     let _: () = timed(bus.call(
         "AddMatch",
         &(format!(
@@ -409,7 +449,7 @@ async fn run_session(
         tokio::select! {
             message = stream.messages.next() => {
                 let msg = message.ok_or("session bus disconnected")?.map_err(|e| format!("session bus disconnected: {e}"))?;
-                lifecycle(&msg,owner,Some(session))?;
+                stream.lifecycle(&msg,owner,Some(session))?;
                 if !is_signal(&msg,owner,PORTAL_PATH,GS_IFACE) { continue; }
                 match msg.header().member().map(|m| m.as_str()) {
                     Some("ShortcutsChanged") => {
@@ -622,7 +662,7 @@ where
             }
             msg = stream.messages.next() => {
                 let msg=msg.ok_or("session bus disconnected")?.map_err(|e|e.to_string())?;
-                lifecycle(&msg,owner,session)?;
+                stream.lifecycle(&msg,owner,session)?;
                 if msg.header().message_type()==Type::Signal {
                     if early.len() >= 128 { return Err("portal response queue overflow".into()); }
                     early.push_back(msg);
@@ -661,7 +701,7 @@ where
         tokio::select! {
             msg = stream.messages.next() => {
                 let msg=msg.ok_or("session bus disconnected")?.map_err(|e|e.to_string())?;
-                lifecycle(&msg,owner,session)?;
+                stream.lifecycle(&msg,owner,session)?;
                 if let Some(result)=response_from(&msg,owner,&request) {
                     stream.changes.clear();
                     return result;

@@ -1,6 +1,6 @@
 [package]
 name = "wispr-flow-linux-helper"
-version = "0.1.2+hybrid.1"
+version = "0.1.2+hybrid.2"
 edition = "2021"
 description = "Clean-room Linux helper for Wispr Flow with portal capture on Wayland, XInput2 on X11, and the existing stdin/fd-3 IPC contract."
 license = "Unlicense"
