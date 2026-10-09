@@ -43,6 +43,35 @@ capture and insertion off with an actionable diagnostic; the helper does not
 translate incompatible macOS codes or substitute an unrelated cancellation
 action. Fresh users must finish Wispr setup so it writes valid settings.
 
+## Portal status and saved shortcut changes
+
+The helper emits full `PortalShortcutStatus` snapshots through the existing
+stdin/fd-3 protocol's `HelperAPIRequest` envelope. Its `payload` contains
+`version: 1`, `mode: "portal"`, an overall `state` (`pending`, `ready`, `error`,
+`stopped`), `actions` for the fixed `ptt` and `cancel` IDs, and nullable `error`.
+Each action has `id`, `state` (`pending`, `bound`, `unbound`, `error`), nullable
+`trigger`, and nullable `error`. Trigger descriptions and errors are limited to
+512 UTF-8 bytes each. Every snapshot replaces previous status. A bound trigger
+reports portal approval; physical activation, recording, and insertion still
+require desktop acceptance. Failure and shutdown clear previous bound triggers.
+
+An idle change to valid saved PTT or Dismiss logical chords suspends insertion,
+clears old approval, closes the old portal session, and binds a new session.
+Replacement sessions omit physical trigger suggestions, leaving persisted
+choices to the portal. An unchanged `UpdateShortcuts`, an unrelated preference,
+or an unrelated action that does not invalidate cancellation does not rebind.
+The supported portal action set remains PTT and Cancel; Dismiss's documented
+Escape fallback still supplies the logical Cancel action. Missing or invalid
+PTT and unsafe cancellation mappings after approval are terminal configuration
+faults. Before first approval, invalid or missing saved settings remain pending
+with the reason shown beside the actions; saving valid settings automatically
+continues setup and clears that reason before requesting consent.
+
+Changes during recording or possible processing cancel safely and require an
+explicit Wispr Flow restart. Refresh denial, failed session cleanup, service or
+backend loss also latch capture and insertion off until restart. Late old-session
+signals cannot restore approval or synthesize keys. There is no raw-input fallback.
+
 ## Capture configuration
 
 | `WISPR_CAPTURE` | Behavior |

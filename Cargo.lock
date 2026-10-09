@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "wispr-flow-linux-helper"
-version = "0.1.2+hybrid.2"
+version = "0.1.2+hybrid.3"
 dependencies = [
  "atspi",
  "env_logger",

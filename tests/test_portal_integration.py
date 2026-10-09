@@ -169,14 +169,14 @@ class MockPortal:
             assert self.bind_counts[session] == 1, "BindShortcuts repeated in session"
             record["shortcuts"] = shortcuts
             assert all(s[1]["description"].signature == "s" for s in shortcuts)
-            assert all(s[1]["preferred_trigger"].signature == "s" for s in shortcuts)
+            assert all(s[1].get("preferred_trigger", Variant("s", "")).signature == "s" for s in shortcuts)
             selected = self.options.get("approved_ids")
             bound = [
                 [sid, {
                     "description": properties["description"],
                     "trigger_description": Variant(
                         "s", "" if self.options.get("empty_trigger")
-                        else self.options.get("trigger", properties["preferred_trigger"].value)
+                        else self.options.get("trigger", properties.get("preferred_trigger", Variant("s", "F8" if sid == "ptt" else "F9")).value)
                     ),
                 }]
                 for sid, properties in shortcuts
@@ -208,6 +208,8 @@ class MockPortal:
                 }]])
             })
         if msg.interface == SESSION and msg.member == "Close":
+            if self.options.get("close_error"):
+                return Message.new_error(msg, "org.freedesktop.DBus.Error.Failed", "Mock close failure")
             self.closed.append(msg.path)
             return Message.new_method_return(msg)
         if msg.interface == REQUEST and msg.member == "Close":
@@ -439,6 +441,16 @@ class Helper:
         return [m["HelperAPIRequest"]["KeypressEvent"]["payload"]
                 for m in self.messages
                 if "KeypressEvent" in m.get("HelperAPIRequest", {})]
+
+    def statuses(self):
+        return [m["HelperAPIRequest"]["PortalShortcutStatus"]["payload"]
+                for m in self.messages
+                if "PortalShortcutStatus" in m.get("HelperAPIRequest", {})]
+
+    async def wait_status(self, phase, count=1):
+        await self.wait_for(lambda: len([s for s in self.statuses()
+                                        if s["state"] == phase]) >= count)
+        return [s for s in self.statuses() if s["state"] == phase][-1]
 
     async def wait_keys(self, count):
         await self.wait_for(lambda: len(self.keys()) >= count)
@@ -1100,6 +1112,24 @@ class PortalIntegration(unittest.IsolatedAsyncioTestCase):
         ])
         await self.assert_injection_blocked(helper)
 
+    async def test_first_run_invalid_configuration_reports_pending_reason_and_recovers(self):
+        self.write_shortcuts({"27": "dismiss"})
+        portal, helper = await self.launch()
+        await helper.wait_for(lambda: any(s["state"] == "pending" and s["error"]
+                                          for s in helper.statuses()))
+        snapshot = helper.statuses()[-1]
+        self.assertIn("no PTT action", snapshot["error"])
+        self.assertEqual(snapshot["actions"][0]["state"], "pending")
+        self.assertEqual(portal.sessions, [])
+        self.write_shortcuts({"162+91": "ptt", "27": "dismiss"})
+        await helper.request("UpdateShortcuts", {"payload": {}})
+        ready = await helper.wait_status("ready")
+        self.assertIsNone(ready["error"])
+        self.assertTrue(any(s["state"] == "pending" and s["error"] is None
+                            for s in helper.statuses()[helper.statuses().index(snapshot)+1:]))
+        await portal.emit("Activated")
+        await helper.wait_keys(2)
+
     async def test_fresh_install_waits_for_valid_app_settings_without_defaults(self):
         self.settings_path.unlink()
         portal, helper = await self.launch()
@@ -1138,7 +1168,138 @@ class PortalIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ack_positions), 1)
         self.assertLess(key_positions[-1], ack_positions[0])
 
-    async def test_idle_app_shortcut_update_syncs_without_rebinding_kde(self):
+    async def test_refresh_discards_old_and_forged_signals_and_preserves_physical_choice(self):
+        portal, helper = await self.launch(trigger="Ctrl+Alt+D")
+        ready = await helper.wait_status("ready")
+        self.assertEqual([a["state"] for a in ready["actions"]], ["bound", "bound"])
+        self.assertEqual(ready["actions"][0]["trigger"], "Ctrl+Alt+D")
+        old = portal.sessions[0]["path"]
+        self.write_shortcuts({"163+92": "ptt", "27": "dismiss"})
+        await helper.request("UpdateShortcuts", {"payload": {}})
+        await portal.wait_calls("BindShortcuts", 2)
+        ready = await helper.wait_status("ready", 2)
+        self.assertIn(old, portal.closed)
+        self.assertNotEqual(old, portal.sessions[-1]["path"])
+        self.assertTrue(all("preferred_trigger" not in properties
+                            for _, properties in portal.sessions[-1]["shortcuts"]))
+        self.assertEqual(ready["actions"][0]["trigger"], "Ctrl+Alt+D")
+        alien = await connect_bus(self.address)
+        self.extra_buses.append(alien)
+        await portal.emit("Activated", session=old)
+        await portal.emit("Closed", path=old, interface=SESSION,
+                          signature="a{sv}", body=[{}])
+        await portal.emit("ShortcutsChanged", signature="oa(sa{sv})", body=[old, []])
+        await portal.emit("Activated", bus=alien)
+        await portal.emit("ShortcutsChanged", bus=alien,
+                          signature="oa(sa{sv})", body=[portal.sessions[-1]["path"], []])
+        await asyncio.sleep(0.05)
+        self.assertEqual(helper.keys(), [])
+        self.assertEqual(helper.statuses()[-1], ready)
+        await portal.emit("Activated")
+        await helper.wait_keys(2)
+        self.assert_key_pairs(helper, [(163, "key_event_press"), (92, "key_event_press")])
+
+    async def test_refresh_pending_then_denial_clears_success_and_latches(self):
+        portal, helper = await self.launch()
+        await helper.wait_status("ready")
+        portal.options["pause_bind"] = True
+        self.write_shortcuts({"163+92": "ptt", "27": "dismiss"})
+        await helper.request("UpdateShortcuts", {"payload": {}})
+        await portal.wait_calls("BindShortcuts", 2)
+        pending = helper.statuses()[-1]
+        self.assertEqual(pending["state"], "pending")
+        self.assertTrue(all(a["trigger"] is None for a in pending["actions"]))
+        await self.assert_injection_blocked(helper)
+        await portal.emit("Activated")
+        reply = portal.pending[0]
+        reply.body = [2, {}]
+        await portal.bus.send(reply)
+        error = await helper.wait_status("error")
+        self.assertTrue(all(a["state"] == "error" and a["trigger"] is None
+                            for a in error["actions"]))
+        self.assertIn("restart", error["error"])
+        portal.options["pause_bind"] = False
+        self.write_shortcuts({"162+91": "ptt", "27": "dismiss"})
+        await helper.request("UpdateShortcuts", {"payload": {}})
+        await portal.emit("Activated")
+        await asyncio.sleep(0.15)
+        self.assertEqual(helper.keys(), [])
+        self.assertEqual(len(portal.sessions), 2)
+        await self.assert_injection_blocked(helper)
+        # Recovery explicitly starts a new process, never reopens the latch.
+        restarted = await Helper(self.address, self.temporary).start()
+        self.helpers.append(restarted)
+        await restarted.wait_status("ready")
+        await portal.emit("Activated")
+        await restarted.wait_keys(2)
+        self.assertEqual(helper.keys(), [])
+
+    async def test_recording_started_during_refresh_cancels_and_never_reopens_gate(self):
+        portal, helper = await self.launch()
+        await helper.wait_status("ready")
+        portal.options["pause_bind"] = True
+        self.write_shortcuts({"163+92": "ptt", "164+27": "dismiss"})
+        await helper.request("UpdateShortcuts", {"payload": {}})
+        await portal.wait_calls("BindShortcuts", 2)
+        await helper.request("RecordingStarted")
+        await portal.bus.send(portal.pending[0])
+        error = await helper.wait_status("error")
+        self.assertIn("dictation started", error["error"])
+        await helper.wait_keys(4)
+        self.assert_key_pairs(helper, [(164, "key_event_press"), (27, "key_event_press"),
+                                       (27, "key_event_release"), (164, "key_event_release")])
+        await self.assert_injection_blocked(helper)
+
+    async def test_shutdown_during_refresh_has_terminal_status(self):
+        portal, helper = await self.launch()
+        await helper.wait_status("ready")
+        portal.options["pause_bind"] = True
+        self.write_shortcuts({"163+92": "ptt", "27": "dismiss"})
+        await helper.request("UpdateShortcuts", {"payload": {}})
+        await portal.wait_calls("BindShortcuts", 2)
+        await helper.request("HelperAppShutdown")
+        await asyncio.wait_for(helper.proc.wait(), TIMEOUT)
+        await asyncio.wait_for(helper.read_task, TIMEOUT)
+        snapshots = helper.statuses()
+        stopped = next(i for i, s in enumerate(snapshots) if s["state"] == "stopped")
+        self.assertTrue(all(s["state"] == "stopped" for s in snapshots[stopped:]))
+        self.assertTrue(all(a["trigger"] is None for a in snapshots[-1]["actions"]))
+
+    async def test_old_session_close_failure_prevents_replacement(self):
+        portal, helper = await self.launch()
+        await helper.wait_status("ready")
+        portal.options["close_error"] = True
+        self.write_shortcuts({"163+92": "ptt", "27": "dismiss"})
+        await helper.request("UpdateShortcuts", {"payload": {}})
+        error = await helper.wait_status("error")
+        self.assertIn("closing old shortcut session failed", error["error"])
+        self.assertEqual(len(portal.sessions), 1)
+        await portal.emit("Activated")
+        await asyncio.sleep(0.05)
+        self.assertEqual(helper.keys(), [])
+        await self.assert_injection_blocked(helper)
+
+    async def test_unchanged_update_and_other_action_do_not_reprompt(self):
+        portal, helper = await self.launch()
+        await helper.wait_status("ready")
+        self.write_shortcuts({"162+91": "ptt", "27": "dismiss", "120": "toggle"})
+        for _ in range(3):
+            await helper.request("UpdateShortcuts", {"payload": {}})
+        await asyncio.sleep(0.25)
+        self.assertEqual(len(portal.sessions), 1)
+        self.assertEqual(list(portal.bind_counts.values()), [1])
+
+    async def test_status_strings_are_bounded_utf8_and_use_existing_framing(self):
+        portal, helper = await self.launch(trigger="é+|" * 1000)
+        ready = await helper.wait_status("ready")
+        self.assertLessEqual(len(ready["actions"][0]["trigger"].encode()), 512)
+        self.assertIn("é+|", ready["actions"][0]["trigger"])
+        self.assertTrue(all(len(raw) < 30000 for raw in helper.raw_frames))
+        await portal.close_session()
+        error = await helper.wait_status("error")
+        self.assertTrue(all(a["trigger"] is None for a in error["actions"]))
+
+    async def test_idle_app_shortcut_update_replaces_session(self):
         portal, helper = await self.launch()
         await portal.wait_calls("BindShortcuts")
         await helper.wait_registered()
@@ -1154,7 +1315,7 @@ class PortalIntegration(unittest.IsolatedAsyncioTestCase):
             (92, "key_event_release"), (163, "key_event_release"),
         ])
         self.assertEqual(self.settings_path.read_text(), saved)
-        self.assertEqual(list(portal.bind_counts.values()), [1])
+        self.assertEqual(list(portal.bind_counts.values()), [1, 1])
 
     async def test_completed_cancel_allows_later_idle_configuration_update(self):
         portal, helper = await self.launch()
@@ -1172,7 +1333,7 @@ class PortalIntegration(unittest.IsolatedAsyncioTestCase):
         self.assert_key_pairs(helper, FAULT_KEYS + [
             (163, "key_event_press"), (92, "key_event_press"),
         ])
-        self.assertEqual(list(portal.bind_counts.values()), [1])
+        self.assertEqual(list(portal.bind_counts.values()), [1, 1])
 
     async def test_content_poll_detects_atomic_same_mtime_configuration_update(self):
         portal, helper = await self.launch()
@@ -1188,7 +1349,7 @@ class PortalIntegration(unittest.IsolatedAsyncioTestCase):
         self.assert_key_pairs(helper, [
             (163, "key_event_press"), (92, "key_event_press"),
         ])
-        self.assertEqual(list(portal.bind_counts.values()), [1])
+        self.assertEqual(list(portal.bind_counts.values()), [1, 1])
 
     async def test_app_shortcut_update_during_recording_cancels_with_new_dismiss(self):
         portal, helper = await self.launch()
@@ -1251,13 +1412,15 @@ class PortalIntegration(unittest.IsolatedAsyncioTestCase):
         self.write_shortcuts({"163+92": "ptt", "164+27": "dismiss"})
         await helper.request("UpdateShortcuts", {"payload": {}})
         await portal.bus.send(portal.pending[0])
+        await portal.wait_calls("BindShortcuts", 2)
+        await portal.bus.send(portal.pending[1])
         await helper.wait_registered()
         await portal.emit("Activated")
         await helper.wait_keys(2)
         self.assert_key_pairs(helper, [
             (163, "key_event_press"), (92, "key_event_press"),
         ])
-        self.assertEqual(list(portal.bind_counts.values()), [1])
+        self.assertEqual(list(portal.bind_counts.values()), [1, 1])
 
     async def test_invalid_current_cancel_releases_without_guessing_old_dismiss(self):
         portal, helper = await self.launch()

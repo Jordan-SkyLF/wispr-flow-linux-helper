@@ -6,7 +6,9 @@ use super::config::{self, LogicalShortcuts};
 use super::portal_state::{ShortcutState, CANCEL, PTT};
 use super::{emit_keypress, HeldKeys};
 use crate::backend::EventSink;
+use crate::proto;
 use futures_util::{pin_mut, StreamExt};
+use serde_json::json;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -72,6 +74,53 @@ impl PortalStream {
     }
 }
 
+// Full snapshots replace previous UI successes, including on refresh/failure.
+// Bound is consent, never evidence that a physical activation was delivered.
+static STATUS_INDEX: AtomicU64 = AtomicU64::new(0);
+fn bounded(text: &str) -> String {
+    let mut end = text.len().min(512);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+fn report_status(
+    events: &EventSink,
+    phase: &str,
+    bound: &HashMap<String, String>,
+    error: Option<&str>,
+) {
+    let error = error.map(bounded);
+    let actions: Vec<_> = [PTT, CANCEL]
+        .into_iter()
+        .map(|id| {
+            let trigger = if phase == "ready" {
+                bound.get(id).map(|s| bounded(s))
+            } else {
+                None
+            };
+            let state = match phase {
+                "ready" if trigger.is_some() => "bound",
+                "ready" => "unbound",
+                "pending" => "pending",
+                _ => "error",
+            };
+            json!({"id":id,"state":state,"trigger":trigger,"error":error})
+        })
+        .collect();
+    let _ = events.send(proto::request(
+        "PortalShortcutStatus",
+        json!({"payload": {
+            "version":1,"mode":"portal","state":phase,"actions":actions,"error":error
+        }}),
+        &format!(
+            "portal-status-{}-{}",
+            std::process::id(),
+            STATUS_INDEX.fetch_add(1, Ordering::Relaxed)
+        ),
+    ));
+}
+
 #[derive(Default)]
 struct Shared {
     state: Mutex<ShortcutState>,
@@ -85,6 +134,26 @@ struct PortalHeld {
     config_path: PathBuf,
 }
 impl Shared {
+    fn status(
+        &self,
+        events: &EventSink,
+        phase: &str,
+        bound: &HashMap<String, String>,
+        error: Option<&str>,
+    ) {
+        // Serialize snapshots with shutdown/fault/key cleanup. A ready snapshot
+        // racing shutdown cannot revive an already cleared success in the UI.
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(phase, "pending" | "ready")
+            && (state.faulted || self.shutdown.load(Ordering::Acquire))
+        {
+            return;
+        }
+        if phase == "error" && self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        report_status(events, phase, bound, error);
+    }
     fn emit(&self, events: &EventSink, changes: Vec<(u32, bool)>) {
         for (vk, down) in changes {
             emit_keypress(events, &self.index, std::process::id(), vk, down);
@@ -127,10 +196,22 @@ impl HeldKeys for PortalHeld {
     fn shutdown(&self) {
         self.shared.shutdown.store(true, Ordering::Release);
         terminal_fault(&self.events, &self.shared, &self.config_path);
+        self.shared.status(
+            &self.events,
+            "stopped",
+            &HashMap::new(),
+            Some("Helper stopped; restart Wispr Flow to register shortcuts"),
+        );
     }
 }
 
+pub(super) fn report_start_error(events: &EventSink, error: &str) {
+    super::block_injection();
+    report_status(events, "error", &HashMap::new(), Some(error));
+}
+
 pub fn start(events: EventSink) -> Result<Box<dyn HeldKeys>, String> {
+    report_status(&events, "pending", &HashMap::new(), None);
     let cfg_path = config::config_path().ok_or("HOME/XDG_CONFIG_HOME is missing")?;
     let app_id = std::env::var("WISPR_PORTAL_APP_ID").unwrap_or_else(|_| APP_ID.into());
     if !valid_app_id(&app_id) {
@@ -146,6 +227,8 @@ pub fn start(events: EventSink) -> Result<Box<dyn HeldKeys>, String> {
             .and_then(|rt| rt.block_on(run(&output, &worker, &cfg_path, &app_id)));
         terminal_fault(&output, &worker, &cfg_path);
         if let Err(error) = result {
+            if worker.shutdown.load(Ordering::Acquire) { return; }
+            worker.status(&output, "error", &HashMap::new(), Some(&format!("{error}; restart Wispr Flow to register shortcuts")));
             log::error!("GlobalShortcuts stopped: {error}. Capture and insertion are disabled until Wispr Flow restarts. No raw-input fallback.");
         }
     }).map_err(|e| format!("start portal worker: {e}"))?;
@@ -168,7 +251,11 @@ fn valid_app_id(id: &str) -> bool {
         })
 }
 
-async fn wait_for_config(path: &Path, shared: &Shared) -> Result<LogicalShortcuts, String> {
+async fn wait_for_config(
+    path: &Path,
+    shared: &Shared,
+    events: &EventSink,
+) -> Result<LogicalShortcuts, String> {
     let mut previous = String::new();
     loop {
         if shared.shutdown.load(Ordering::Acquire) {
@@ -179,6 +266,7 @@ async fn wait_for_config(path: &Path, shared: &Shared) -> Result<LogicalShortcut
             Err(error) => {
                 if error != previous {
                     log::warn!("portal waiting for Wispr shortcut configuration: {error}. Finish first-run setup or reset incompatible shortcuts in Wispr; capture and insertion remain off.");
+                    shared.status(events, "pending", &HashMap::new(), Some(&error));
                     previous = error;
                 }
             }
@@ -188,7 +276,7 @@ async fn wait_for_config(path: &Path, shared: &Shared) -> Result<LogicalShortcut
 }
 
 async fn run(events: &EventSink, shared: &Shared, path: &Path, app_id: &str) -> Result<(), String> {
-    let logical = wait_for_config(path, shared).await?;
+    let logical = wait_for_config(path, shared, events).await?;
     shared
         .state
         .lock()
@@ -293,40 +381,88 @@ async fn run(events: &EventSink, shared: &Shared, path: &Path, app_id: &str) -> 
     }
     // Pin identity AND calls to this owner; drain its queued owner-loss event
     // inside portal_call so a restart during Register cannot silently succeed.
-    let options = HashMap::from([
-        ("handle_token", Value::from("wf_create")),
-        ("session_handle_token", Value::from("wf_session")),
-    ]);
-    let mut created =
-        portal_call(&mut stream, &gs, &owner, "CreateSession", &(options,), None).await?;
-    // The spec intentionally uses a string variant, not an object-path variant.
-    let session = String::try_from(
-        created
-            .remove("session_handle")
-            .ok_or("CreateSession omitted session_handle")?,
-    )
-    .map_err(|e| format!("invalid session handle: {e}"))?;
-    if !session.starts_with(&format!("{PORTAL_PATH}/session/")) {
-        return Err("session handle outside portal namespace".into());
+    let mut generation = 0u64;
+    loop {
+        if shared.shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        generation += 1;
+        shared.status(events, "pending", &HashMap::new(), None);
+        let create_token = format!("wf_create_{generation}");
+        let session_token = format!("wf_session_{generation}");
+        let options = HashMap::from([
+            ("handle_token", Value::from(create_token.as_str())),
+            ("session_handle_token", Value::from(session_token.as_str())),
+        ]);
+        let mut created =
+            portal_call(&mut stream, &gs, &owner, "CreateSession", &(options,), None).await?;
+        let session = String::try_from(
+            created
+                .remove("session_handle")
+                .ok_or("CreateSession omitted session_handle")?,
+        )
+        .map_err(|e| format!("invalid session handle: {e}"))?;
+        if !session.starts_with(&format!("{PORTAL_PATH}/session/")) {
+            return Err("session handle outside portal namespace".into());
+        }
+        let session = OwnedObjectPath::try_from(session).map_err(|e| e.to_string())?;
+        let initial = shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .logical
+            .clone()
+            .ok_or("missing logical shortcuts")?;
+        let result = run_session(
+            events,
+            shared,
+            path,
+            &initial,
+            &mut stream,
+            &gs,
+            &owner,
+            &session,
+            generation,
+        )
+        .await;
+        // Clear the gate before cleanup; only a successful replacement can reopen it.
+        if !matches!(result, Ok(true)) {
+            terminal_fault(events, shared, path);
+            if let Err(error) = &result {
+                shared.status(
+                    events,
+                    "error",
+                    &HashMap::new(),
+                    Some(&format!(
+                        "{error}; restart Wispr Flow to register shortcuts"
+                    )),
+                );
+            }
+        }
+        let close = async {
+            let proxy = Proxy::new(&conn, owner.as_str(), session.as_str(), SESSION_IFACE).await?;
+            timed(proxy.call::<_, _, ()>("Close", &())).await
+        };
+        let cleanup = tokio::time::timeout(Duration::from_secs(2), close)
+            .await
+            .map_err(|_| "closing old shortcut session timed out; restart required".to_owned())
+            .and_then(|r| {
+                r.map_err(|e| format!("closing old shortcut session failed: {e}; restart required"))
+            });
+        // A terminal transport/permission error remains the primary reason.
+        // Refresh requires successful Close; terminal teardown is best effort.
+        if let Err(error) = cleanup {
+            if matches!(result, Ok(true)) {
+                return Err(error);
+            }
+            log::warn!("portal session cleanup: {error}");
+        }
+        stream.changes.clear();
+        match result? {
+            true => continue,
+            false => return Ok(()),
+        }
     }
-    let session = OwnedObjectPath::try_from(session).map_err(|e| e.to_string())?;
-    let result = run_session(
-        events,
-        shared,
-        path,
-        &logical,
-        &mut stream,
-        &gs,
-        &owner,
-        &session,
-    )
-    .await;
-    terminal_fault(events, shared, path);
-    if let Ok(proxy) = Proxy::new(&conn, owner.as_str(), session.as_str(), SESSION_IFACE).await {
-        let _ = tokio::time::timeout(Duration::from_secs(2), proxy.call::<_, _, ()>("Close", &()))
-            .await;
-    }
-    result
 }
 
 async fn timed<T>(future: impl std::future::Future<Output = zbus::Result<T>>) -> zbus::Result<T> {
@@ -366,9 +502,10 @@ async fn run_session(
     gs: &Proxy<'_>,
     owner: &str,
     session: &OwnedObjectPath,
-) -> Result<(), String> {
+    generation: u64,
+) -> Result<bool, String> {
     let (ptt_trigger, cancel_trigger) = suggested_triggers(initial);
-    let shortcuts = vec![
+    let mut shortcuts = vec![
         (
             PTT,
             HashMap::from([
@@ -384,7 +521,14 @@ async fn run_session(
             ]),
         ),
     ];
-    let options = HashMap::from([("handle_token", Value::from("wf_bind"))]);
+    // On replacement leave the physical choice to persisted portal consent.
+    if generation > 1 {
+        for (_, properties) in &mut shortcuts {
+            properties.remove("preferred_trigger");
+        }
+    }
+    let bind_token = format!("wf_bind_{generation}");
+    let options = HashMap::from([("handle_token", Value::from(bind_token.as_str()))]);
     // Bind once per new session, including when KDE has persisted shortcuts.
     let mut response = portal_call(
         stream,
@@ -426,6 +570,9 @@ async fn run_session(
         if state.faulted {
             return Err("capture already stopped during setup".into());
         }
+        if generation > 1 && state.busy() {
+            return Err("dictation started while portal shortcuts were being refreshed; cancellation and restart required".into());
+        }
         if state.logical.as_ref() != Some(&latest) && state.busy() {
             super::block_injection();
             let changes = state.fault(Some(&latest.cancel));
@@ -434,6 +581,12 @@ async fn run_session(
                 "shortcut settings changed during recording while awaiting permission".into(),
             );
         }
+        if state.logical.as_ref() != Some(&latest) {
+            super::suspend_portal_injection();
+            state.logical = Some(latest);
+            state.approved.clear();
+            return Ok(true);
+        }
         state.logical = Some(latest);
         state.approved = registered.keys().cloned().collect();
         if registered.contains_key(PTT) {
@@ -441,6 +594,7 @@ async fn run_session(
         }
     }
     report_bindings(&registered);
+    shared.status(events, "ready", &registered, None);
     let mut observed = HashSet::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -457,23 +611,28 @@ async fn run_session(
                         if changed != *session { continue; }
                         let new = approved_bindings(bound)?;
                         if new == registered { continue; }
-                        if shared.state.lock().unwrap_or_else(|e| e.into_inner()).busy() {
-                            return Err("KDE shortcuts changed during possible recording/processing; cancellation required".into());
+                        {
+                            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                            if state.faulted || shared.shutdown.load(Ordering::Acquire) { return Ok(false); }
+                            if state.busy() {
+                                return Err("KDE shortcuts changed during possible recording/processing; cancellation required".into());
+                            }
+                            if registered.contains_key(PTT) && !new.contains_key(PTT) {
+                                return Err("KDE revoked or removed the active PTT binding".into());
+                            }
+                            state.approved = new.keys().cloned().collect();
+                            registered = new;
+                            if registered.contains_key(PTT) { super::allow_injection(); }
                         }
-                        if registered.contains_key(PTT) && !new.contains_key(PTT) {
-                            return Err("KDE revoked or removed the active PTT binding".into());
-                        }
-                        shared.state.lock().unwrap_or_else(|e| e.into_inner()).approved = new.keys().cloned().collect();
-                        registered = new;
                         observed.clear();
-                        if registered.contains_key(PTT) { super::allow_injection(); }
                         report_bindings(&registered);
+                        shared.status(events, "ready", &registered, None);
                     }
                     Some(member @ ("Activated"|"Deactivated")) => {
                         let (sig_session,id,_timestamp,_options): (OwnedObjectPath,String,u64,Results) = msg.body().deserialize().map_err(|e| e.to_string())?;
                         if sig_session != *session || !registered.contains_key(&id) { continue; }
                         let down = member=="Activated";
-                        if down { synchronize_config(events, shared, config_path)?; }
+                        if down && synchronize_config(events, shared, config_path)? { return Ok(true); }
                         let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
                         let changes = state.transition(&id,down,Instant::now());
                         shared.emit(events,changes);
@@ -485,21 +644,21 @@ async fn run_session(
                 }
             }
             _ = tick.tick() => {
-                if shared.shutdown.load(Ordering::Acquire) { return Ok(()); }
+                if shared.shutdown.load(Ordering::Acquire) { return Ok(false); }
                 if shared.state.lock().unwrap_or_else(|e| e.into_inner()).expired(Instant::now()) {
                     return Err("shortcut release missing or hold exceeded five minutes; cancelling rather than completing recording".into());
                 }
                 let dirty = shared.dirty.swap(false,Ordering::AcqRel);
                 if dirty || Instant::now() >= next_config {
                     next_config = Instant::now()+CONFIG_POLL;
-                    synchronize_config(events, shared, config_path)?;
+                    if synchronize_config(events, shared, config_path)? { return Ok(true); }
                 }
             }
         }
     }
 }
 
-fn synchronize_config(events: &EventSink, shared: &Shared, path: &Path) -> Result<(), String> {
+fn synchronize_config(events: &EventSink, shared: &Shared, path: &Path) -> Result<bool, String> {
     let new = match config::read_shortcuts(path) {
         Ok(logical) => logical,
         Err(error) => {
@@ -517,10 +676,14 @@ fn synchronize_config(events: &EventSink, shared: &Shared, path: &Path) -> Resul
             shared.emit(events, changes);
             return Err("Wispr shortcuts changed during possible recording/processing; cancelled using the new logical Dismiss; restart required".into());
         }
-        log::info!("Wispr logical shortcuts synchronized: PTT {:?}, Dismiss {:?}; KDE physical bindings retained", new.ptt, new.cancel);
+        super::suspend_portal_injection();
+        state.approved.clear();
         state.logical = Some(new);
+        report_status(events, "pending", &HashMap::new(), None);
+        log::info!("Wispr logical shortcuts changed; replacing the portal session while idle");
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn terminal_fault(events: &EventSink, shared: &Shared, path: &Path) {
@@ -721,6 +884,60 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn status_snapshots_clear_success_and_bound_utf8_with_existing_frames() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        report_status(
+            &tx,
+            "ready",
+            &HashMap::from([(PTT.into(), "é+|".repeat(1000))]),
+            None,
+        );
+        let ready = rx.recv().unwrap();
+        let actions = &ready["HelperAPIRequest"]["PortalShortcutStatus"]["payload"]["actions"];
+        assert_eq!(actions[0]["state"], "bound");
+        assert_eq!(actions[1]["state"], "unbound");
+        assert!(actions[0]["trigger"].as_str().unwrap().len() <= 512);
+        let frame = proto::encode(&ready).unwrap();
+        let decoded = proto::FrameDecoder::default().feed(&frame);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&decoded[0]).unwrap(),
+            ready
+        );
+        for phase in ["pending", "error", "stopped"] {
+            report_status(
+                &tx,
+                phase,
+                &HashMap::from([(PTT.into(), "F8".into())]),
+                Some(&"é".repeat(1000)),
+            );
+            let snapshot = rx.recv().unwrap();
+            let payload = &snapshot["HelperAPIRequest"]["PortalShortcutStatus"]["payload"];
+            assert!(payload["error"].as_str().unwrap().len() <= 512);
+            assert!(payload["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["trigger"].is_null()));
+        }
+    }
+    #[test]
+    fn terminal_snapshots_cannot_be_followed_by_stale_success() {
+        let shared = Shared::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        shared.shutdown.store(true, Ordering::Release);
+        shared.state.lock().unwrap().faulted = true;
+        shared.status(&tx, "stopped", &HashMap::new(), None);
+        shared.status(
+            &tx,
+            "ready",
+            &HashMap::from([(PTT.into(), "F8".into())]),
+            None,
+        );
+        shared.status(&tx, "pending", &HashMap::new(), None);
+        shared.status(&tx, "error", &HashMap::new(), Some("late worker error"));
+        assert_eq!(rx.try_iter().count(), 1);
+    }
     #[test]
     fn registered_but_unbound_and_unknown_ids_are_not_approved() {
         let value = |s: &str| OwnedValue::try_from(Value::from(s)).unwrap();

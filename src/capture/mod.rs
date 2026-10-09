@@ -13,15 +13,18 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 // Block insertion before fault cancellation reaches the app, including a
-// transcription request already in flight. Only initial portal approval opens
-// this gate; a terminal portal fault never retries within this process.
-// 0 = awaiting initial approval; 1 = permitted; 2 = terminal failure.
+// transcription request already in flight. Portal approval opens this gate,
+// including an idle session replacement; a terminal fault never retries.
+// 0 = awaiting approval; 1 = permitted; 2 = terminal failure.
 static INJECTION_STATE: AtomicU8 = AtomicU8::new(1);
 pub(crate) fn injection_allowed() -> bool {
     INJECTION_STATE.load(Ordering::Acquire) == 1
 }
 pub(super) fn block_injection() {
     INJECTION_STATE.store(2, Ordering::Release);
+}
+pub(super) fn suspend_portal_injection() {
+    let _ = INJECTION_STATE.compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire);
 }
 fn await_portal_approval() {
     let _ = INJECTION_STATE.compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire);
@@ -106,9 +109,10 @@ pub fn spawn(events: EventSink) -> Box<dyn HeldKeys> {
     match configured_mode() {
         Ok(CaptureMode::Portal) => {
             await_portal_approval();
-            match portal::start(events) {
+            match portal::start(events.clone()) {
                 Ok(held) => held,
                 Err(e) => {
+                    portal::report_start_error(&events, &e);
                     log::error!("portal capture disabled: {e}; fix configuration and restart Wispr Flow. No raw-input fallback.");
                     Box::new(NoHeldKeys)
                 }
